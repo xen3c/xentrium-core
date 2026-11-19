@@ -1,0 +1,14 @@
+[package]
+name = "xentrium-crypto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+sha2.workspace = true
+rand.workspace = true
+aes-gcm.workspace = true
+argon2.workspace = true
+bs58.workspace = true
+xentrium-shared = { path = "../xentrium-shared" }
+thiserror.workspace = true

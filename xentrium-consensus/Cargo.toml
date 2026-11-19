@@ -1,0 +1,16 @@
+[package]
+name = "xentrium-consensus"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+xentrium-shared = { path = "../xentrium-shared" }
+xentrium-crypto = { path = "../xentrium-crypto" }
+xentrium-storage = { path = "../xentrium-storage" }
+sha2.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+chrono.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

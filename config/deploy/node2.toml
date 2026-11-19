@@ -1,0 +1,25 @@
+# Xentrium First Testnet — Node 2
+# Replace <NODE1_PUBLIC_IP> with node1's public IPv4 before launch.
+# If node2 has a public IP / port forwarding, peers can reach it directly;
+# otherwise it connects outbound to node1 and receives traffic over that connection.
+
+[node]
+node_id = "testnet-node-2"
+address = "0.0.0.0"
+port = 30304
+data_dir = "./data/node2"
+
+[network]
+bootstrap_peers = ["<NODE1_PUBLIC_IP>:30303"]
+max_peers = 50
+heartbeat_interval_secs = 30
+connection_timeout_secs = 120
+allowed_node_ids = []
+
+[consensus]
+auto_committee_rotation = true
+snapshot_interval_hours = 24
+
+[logging]
+level = "info"
+file = "./data/node2/xentrium.log"

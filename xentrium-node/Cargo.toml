@@ -1,0 +1,26 @@
+[package]
+name = "xentrium-node"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "xentrium"
+path = "src/main.rs"
+
+[dependencies]
+xentrium-shared = { path = "../xentrium-shared" }
+xentrium-crypto = { path = "../xentrium-crypto" }
+xentrium-consensus = { path = "../xentrium-consensus" }
+xentrium-network = { path = "../xentrium-network" }
+xentrium-storage = { path = "../xentrium-storage" }
+tokio = { workspace = true, features = ["full", "signal"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { workspace = true }
+toml = { workspace = true }
+clap = { version = "4.4", features = ["derive"] }
+
+[dev-dependencies]
+rcgen = "0.13"

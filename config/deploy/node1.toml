@@ -1,0 +1,24 @@
+# Xentrium First Testnet — Node 1 (Bootstrap/Seed)
+
+[node]
+node_id = "testnet-node-1"
+address = "0.0.0.0"
+port = 30303
+data_dir = "./data/node1"
+
+[network]
+bootstrap_peers = []
+max_peers = 50
+heartbeat_interval_secs = 30
+connection_timeout_secs = 120
+# Invite-only lockdown: after first boot collect each node's identity().node_id
+# from startup logs and list them here, then restart. Empty = open testnet.
+allowed_node_ids = []
+
+[consensus]
+auto_committee_rotation = true
+snapshot_interval_hours = 24
+
+[logging]
+level = "info"
+file = "./data/node1/xentrium.log"

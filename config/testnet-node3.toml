@@ -1,0 +1,20 @@
+# Xentrium Testnet Node 3
+[node]
+node_id = "testnet-node-3"
+address = "0.0.0.0"
+port = 30305
+data_dir = "./data/testnet-node3"
+
+[network]
+bootstrap_peers = ["<NODE1_IP>:30303", "<NODE2_IP>:30304"]
+max_peers = 50
+heartbeat_interval_secs = 30
+connection_timeout_secs = 120
+
+[consensus]
+auto_committee_rotation = true
+snapshot_interval_hours = 24
+
+[logging]
+level = "info"
+file = "./data/testnet-node3/xentrium.log"
