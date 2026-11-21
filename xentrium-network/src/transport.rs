@@ -116,15 +116,18 @@ impl TcpTransport {
         }
     }
 
-    /// Accept incoming connection (TLS if enabled)
-    pub async fn accept(&self) -> Result<TcpConnection> {
+    /// Accept a raw TCP connection without performing the TLS handshake
+    pub async fn accept_tcp(&self) -> Result<(TcpStream, SocketAddr)> {
         let listener = self.listener.as_ref()
             .ok_or_else(|| NetworkError::ConnectionError("Not listening".to_string()))?;
 
-        let (stream, addr) = listener.accept()
+        listener.accept()
             .await
-            .map_err(|e| NetworkError::ConnectionError(format!("Accept failed: {}", e)))?;
+            .map_err(|e| NetworkError::ConnectionError(format!("Accept failed: {}", e)))
+    }
 
+    /// Upgrade an accepted TCP stream into a connection (performs TLS handshake if enabled)
+    pub async fn upgrade_connection(&self, stream: TcpStream, addr: SocketAddr) -> Result<TcpConnection> {
         let peer_id = PeerID::new(
             "unknown".to_string(),
             addr,
@@ -141,6 +144,12 @@ impl TcpTransport {
         } else {
             Ok(TcpConnection::new(peer_id, stream))
         }
+    }
+
+    /// Accept incoming connection (TLS if enabled)
+    pub async fn accept(&self) -> Result<TcpConnection> {
+        let (stream, addr) = self.accept_tcp().await?;
+        self.upgrade_connection(stream, addr).await
     }
 
     /// Get local address

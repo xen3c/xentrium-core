@@ -636,26 +636,34 @@ impl Node {
                 self.config.node_id.clone(),
             );
 
-            match transport.connect(peer_id.clone()).await {
-                Ok(mut connection) => {
-                    info!("Connected to bootstrap peer: {}", addr);
-                    // Send signed handshake
-                    let hs = self.identity.create_handshake(&self.config.network_address);
-                    if let Ok(payload) = Message::serialize_handshake(&hs) {
-                        let _ = connection.send(Message::new(
-                            MessageType::Handshake,
-                            self.identity.node_id.clone().into_bytes(),
-                            payload,
-                        )).await;
+            match tokio::time::timeout(
+                tokio::time::Duration::from_secs(30),
+                transport.connect(peer_id.clone())
+            ).await {
+                Ok(connect_result) => match connect_result {
+                    Ok(mut connection) => {
+                        info!("Connected to bootstrap peer: {}", addr);
+                        // Send signed handshake
+                        let hs = self.identity.create_handshake(&self.config.network_address);
+                        if let Ok(payload) = Message::serialize_handshake(&hs) {
+                            let _ = connection.send(Message::new(
+                                MessageType::Handshake,
+                                self.identity.node_id.clone().into_bytes(),
+                                payload,
+                            )).await;
+                        }
+                        let mut peer = Peer::new(peer_id.clone());
+                        peer.set_state(PeerState::Connected);
+                        discovery.add_peer(peer)
+                            .map_err(|e| XentriumError::DatabaseError(format!("Failed to add peer: {}", e)))?;
+                        connections.insert(addr, connection);
                     }
-                    let mut peer = Peer::new(peer_id.clone());
-                    peer.set_state(PeerState::Connected);
-                    discovery.add_peer(peer)
-                        .map_err(|e| XentriumError::DatabaseError(format!("Failed to add peer: {}", e)))?;
-                    connections.insert(addr, connection);
+                    Err(e) => {
+                        info!("Failed to connect to bootstrap peer {}: {:?}", addr, e);
+                    }
                 }
-                Err(e) => {
-                    info!("Failed to connect to bootstrap peer {}: {:?}", addr, e);
+                Err(_) => {
+                    info!("Timed out connecting to bootstrap peer {}", addr);
                 }
             }
         }
@@ -743,39 +751,70 @@ impl Node {
                 if !is_running {
                     break;
                 }
-                
-                let transport = transport_a.read().await;
-                match tokio::time::timeout(
-                    tokio::time::Duration::from_millis(50),
-                    transport.accept()
-                ).await {
-                    Ok(Ok(mut connection)) => {
-                        let peer_id = connection.peer_id().clone();
-                        let remote_addr = peer_id.endpoint;
-                        info!("Accepted connection from: {:?}", remote_addr);
-                        
-                        // Send signed handshake to accepted peer
-                        let hs = identity_a.create_handshake(&remote_addr.to_string());
-                        if let Ok(payload) = Message::serialize_handshake(&hs) {
-                            let _ = connection.send(Message::new(
-                                MessageType::Handshake,
-                                identity_a.node_id.clone().into_bytes(),
-                                payload,
-                            )).await;
-                        }
-                        
-                        let mut discovery = discovery_a.write().await;
-                        let mut connections = connections_a.write().await;
-                        
-                        let mut peer = Peer::new(peer_id.clone());
-                        peer.set_state(PeerState::Connected);
-                        let _ = discovery.add_peer(peer);
-                        connections.insert(remote_addr, connection);
-                        info!("Accepted and stored connection from remote {:?}", remote_addr);
+
+                // Time out only the TCP accept so the loop stays responsive to
+                // shutdown; the TLS handshake runs in its own task without a
+                // short timeout, otherwise healthy WAN handshakes get dropped.
+                let accepted = {
+                    let transport = transport_a.read().await;
+                    tokio::time::timeout(
+                        tokio::time::Duration::from_millis(50),
+                        transport.accept_tcp()
+                    ).await
+                };
+
+                match accepted {
+                    Ok(Ok((stream, remote_addr))) => {
+                        let transport_c = transport_a.clone();
+                        let identity_c = identity_a.clone();
+                        let discovery_c = discovery_a.clone();
+                        let connections_c = connections_a.clone();
+                        tokio::spawn(async move {
+                            let mut connection = {
+                                let transport = transport_c.read().await;
+                                match tokio::time::timeout(
+                                    tokio::time::Duration::from_secs(30),
+                                    transport.upgrade_connection(stream, remote_addr)
+                                ).await {
+                                    Ok(Ok(connection)) => connection,
+                                    Ok(Err(e)) => {
+                                        info!("TLS accept failed from {:?}: {:?}", remote_addr, e);
+                                        return;
+                                    }
+                                    Err(_) => {
+                                        info!("TLS accept timed out from {:?}", remote_addr);
+                                        return;
+                                    }
+                                }
+                            };
+
+                            info!("Accepted connection from: {:?}", remote_addr);
+
+                            // Send signed handshake to accepted peer
+                            let hs = identity_c.create_handshake(&remote_addr.to_string());
+                            if let Ok(payload) = Message::serialize_handshake(&hs) {
+                                let _ = connection.send(Message::new(
+                                    MessageType::Handshake,
+                                    identity_c.node_id.clone().into_bytes(),
+                                    payload,
+                                )).await;
+                            }
+
+                            let peer_id = connection.peer_id().clone();
+                            let mut discovery = discovery_c.write().await;
+                            let mut connections = connections_c.write().await;
+
+                            let mut peer = Peer::new(peer_id);
+                            peer.set_state(PeerState::Connected);
+                            let _ = discovery.add_peer(peer);
+                            connections.insert(remote_addr, connection);
+                            info!("Accepted and stored connection from remote {:?}", remote_addr);
+                        });
                     }
                     Ok(Err(e)) => {
+                        // Log and keep accepting — a single bad connection must
+                        // not permanently kill the accept loop.
                         info!("Accept error: {:?}", e);
-                        break;
                     }
                     Err(_) => {
                         // Timeout - normal, continue accepting
