@@ -823,6 +823,82 @@ impl Node {
             }
         });
 
+        // Spawn bootstrap reconnect task — re-dials any bootstrap peer whose
+        // connection was dropped, otherwise a dead link leaves the node
+        // isolated with no recovery.
+        tokio::spawn({
+            let running_rc = self.running.clone();
+            let transport_rc = self.transport.clone();
+            let discovery_rc = self.discovery.clone();
+            let connections_rc = self.connections.clone();
+            let identity_rc = self.identity.clone();
+            let bootstrap_rc = self.config.bootstrap_peers.clone();
+            let network_address_rc = self.config.network_address.clone();
+            let node_id_rc = self.config.node_id.clone();
+            async move {
+                loop {
+                    if !*running_rc.read().await {
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+
+                    for peer_addr in &bootstrap_rc {
+                        let addr = match peer_addr.parse::<std::net::SocketAddr>() {
+                            Ok(a) => a,
+                            Err(_) => continue,
+                        };
+                        let already_connected = {
+                            let connections = connections_rc.read().await;
+                            connections.contains_key(&addr)
+                        };
+                        if already_connected {
+                            continue;
+                        }
+
+                        let peer_id = PeerID::new(
+                            addr.to_string(),
+                            addr,
+                            node_id_rc.clone(),
+                        );
+
+                        let result = {
+                            let transport = transport_rc.read().await;
+                            tokio::time::timeout(
+                                tokio::time::Duration::from_secs(30),
+                                transport.connect(peer_id.clone())
+                            ).await
+                        };
+
+                        match result {
+                            Ok(Ok(mut connection)) => {
+                                info!("Reconnected to bootstrap peer: {}", addr);
+                                let hs = identity_rc.create_handshake(&network_address_rc);
+                                if let Ok(payload) = Message::serialize_handshake(&hs) {
+                                    let _ = connection.send(Message::new(
+                                        MessageType::Handshake,
+                                        node_id_rc.clone().into_bytes(),
+                                        payload,
+                                    )).await;
+                                }
+                                let mut discovery = discovery_rc.write().await;
+                                let mut connections = connections_rc.write().await;
+                                let mut peer = Peer::new(peer_id);
+                                peer.set_state(PeerState::Connected);
+                                let _ = discovery.add_peer(peer);
+                                connections.insert(addr, connection);
+                            }
+                            Ok(Err(e)) => {
+                                info!("Bootstrap reconnect to {} failed: {:?}", addr, e);
+                            }
+                            Err(_) => {
+                                info!("Bootstrap reconnect to {} timed out", addr);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         // Spawn message receive loop task
         tokio::spawn(async move {
             loop {
@@ -830,7 +906,7 @@ impl Node {
                 if !is_running {
                     break;
                 }
-                
+
                 let mut connections_to_remove = Vec::new();
                 
                 let addrs: Vec<std::net::SocketAddr> = {

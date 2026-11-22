@@ -27,6 +27,8 @@ pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 pub struct TcpConnection {
     peer_id: PeerID,
     stream: Box<dyn IoStream>,
+    /// Buffer of received-but-unparsed bytes; keeps receive() cancel-safe
+    recv_buf: Vec<u8>,
     /// Node identity extracted from peer's TLS certificate (if TLS active)
     pub tls_peer_node_id: Option<String>,
     /// Authenticated node identity from verified handshake (set by node runtime)
@@ -40,6 +42,7 @@ impl TcpConnection {
         Self {
             peer_id,
             stream: Box::new(stream),
+            recv_buf: Vec::new(),
             tls_peer_node_id: None,
             auth_node_id: None,
             auth_pubkey: None,
@@ -183,26 +186,38 @@ impl TcpConnection {
     }
 
     /// Receive a message
+    ///
+    /// Cancel-safe: incoming bytes are appended to `recv_buf` before parsing,
+    /// and each poll performs at most one `read()` on the stream. Dropping this
+    /// future mid-frame (e.g. under `tokio::time::timeout`) cannot desynchronize
+    /// the stream — partially received frames simply wait in the buffer.
     pub async fn receive(&mut self) -> Result<Option<Message>> {
-        // Read length prefix
-        let mut len_bytes = [0u8; 4];
-        self.stream.read_exact(&mut len_bytes).await
-            .map_err(|e| NetworkError::IoError(e))?;
-        let len = u32::from_be_bytes(len_bytes) as usize;
+        loop {
+            if self.recv_buf.len() >= 4 {
+                let len = u32::from_be_bytes([
+                    self.recv_buf[0], self.recv_buf[1], self.recv_buf[2], self.recv_buf[3],
+                ]) as usize;
 
-        // C2: reject oversized frames before allocating
-        if len == 0 || len > MAX_MESSAGE_SIZE {
-            return Err(NetworkError::ProtocolError(format!(
-                "Message size {} exceeds limit {}", len, MAX_MESSAGE_SIZE)));
+                // C2: reject oversized frames before allocating
+                if len == 0 || len > MAX_MESSAGE_SIZE {
+                    return Err(NetworkError::ProtocolError(format!(
+                        "Message size {} exceeds limit {}", len, MAX_MESSAGE_SIZE)));
+                }
+
+                if self.recv_buf.len() >= 4 + len {
+                    let payload: Vec<u8> = self.recv_buf.drain(..4 + len).skip(4).collect();
+                    return Ok(Some(deserialize_message(&payload)?));
+                }
+            }
+
+            let mut chunk = [0u8; 8192];
+            let n = self.stream.read(&mut chunk).await
+                .map_err(NetworkError::IoError)?;
+            if n == 0 {
+                return Err(NetworkError::ConnectionError("Connection closed".to_string()));
+            }
+            self.recv_buf.extend_from_slice(&chunk[..n]);
         }
-
-        // Read message
-        let mut buffer = vec![0u8; len];
-        self.stream.read_exact(&mut buffer).await
-            .map_err(|e| NetworkError::IoError(e))?;
-
-        let message = deserialize_message(&buffer)?;
-        Ok(Some(message))
     }
 
     /// Close connection
