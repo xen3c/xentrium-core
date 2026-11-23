@@ -922,6 +922,7 @@ impl Node {
         let node_id_sp = self.config.node_id.clone();
         let own_validator_addr_sp = self.identity.node_id.clone();
         let snapshot_epoch_sp = self.config.snapshot_epoch_secs.max(1);
+        let committee_epoch_sp = self.config.committee_epoch_secs.max(1);
         let snapshot_enabled_sp = self.config.self_register_validator;
         let snapshot_poll_sp = (self.config.snapshot_epoch_secs / 4).clamp(2, 30);
 
@@ -1809,20 +1810,20 @@ impl Node {
                     .as_secs();
                 let snap_state = (now / snapshot_epoch_sp) as i64;
 
-                // Producer = current committee leader
-                let leader = {
-                    let vm = validator_manager_sp.read().await;
-                    vm.get_committee_members().first().cloned()
-                };
-                if leader.as_deref() != Some(own_validator_addr_sp.as_str()) {
-                    continue;
-                }
-
+                // Producer = current committee leader — but only when the
+                // committee is already formed for the current epoch, so a
+                // stale committee can't trigger competing production at an
+                // epoch boundary.
                 let (produce, committee, active, pending) = {
                     let sync = snapshot_sync_sp.read().await;
                     let vm = validator_manager_sp.read().await;
+                    let committee_current =
+                        vm.state_number() >= (now / committee_epoch_sp) as i64;
+                    let leader = vm.get_committee_members().first().cloned();
                     (
-                        snap_state > sync.get_current_state_number(),
+                        committee_current
+                            && leader.as_deref() == Some(own_validator_addr_sp.as_str())
+                            && snap_state > sync.get_current_state_number(),
                         vm.get_committee_members(),
                         vm.get_active_validators().iter().map(|v| v.address.clone()).collect::<Vec<_>>(),
                         vm.get_pending_validators().iter().map(|v| v.address.clone()).collect::<Vec<_>>(),
