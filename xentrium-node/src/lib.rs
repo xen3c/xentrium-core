@@ -1276,12 +1276,6 @@ impl Node {
                                         // Verify signature, freshness, node_id binding
                                         let verified = NodeIdentity::verify_envelope(
                                             &envelope, "xnt-validator-registration");
-                                        // H3: replay protection
-                                        let fresh = verified.is_ok() && {
-                                            let mut guard = replay_guard_b.lock()
-                                                .unwrap_or_else(|e| e.into_inner());
-                                            guard.check_and_insert(&envelope.node_id, envelope.nonce)
-                                        };
                                         // C3: envelope identity must match this connection's
                                         // authenticated identity — OR an identity already
                                         // verified via handshake/announcement gossip, which
@@ -1296,7 +1290,16 @@ impl Node {
                                                 .map(|pk| pk == &envelope.public_key)
                                                 .unwrap_or(false)
                                         };
-                                        if fresh && (direct_match || known_match) {
+                                        // H3: replay protection — checked AFTER auth so a
+                                        // not-yet-known signer doesn't burn its nonce; the
+                                        // envelope stays acceptable once the identity is
+                                        // learned via PeerList gossip.
+                                        let fresh = verified.is_ok() && (direct_match || known_match) && {
+                                            let mut guard = replay_guard_b.lock()
+                                                .unwrap_or_else(|e| e.into_inner());
+                                            guard.check_and_insert(&envelope.node_id, envelope.nonce)
+                                        };
+                                        if fresh {
                                             if let Ok(inner) = verified {
                                                 let validator = Message::deserialize_validator_registration(&inner);
                                                 if let Ok(validator_info) = validator {
@@ -1333,11 +1336,6 @@ impl Node {
                                     if let Ok(envelope) = env {
                                         let verified = NodeIdentity::verify_envelope(
                                             &envelope, "xnt-committee-selection");
-                                        let fresh = verified.is_ok() && {
-                                            let mut guard = replay_guard_b.lock()
-                                                .unwrap_or_else(|e| e.into_inner());
-                                            guard.check_and_insert(&envelope.node_id, envelope.nonce)
-                                        };
                                         let direct_match = connection.auth_node_id.as_deref()
                                             == Some(envelope.node_id.as_str())
                                             && connection.auth_pubkey.as_deref()
@@ -1348,7 +1346,12 @@ impl Node {
                                                 .map(|pk| pk == &envelope.public_key)
                                                 .unwrap_or(false)
                                         };
-                                        if fresh && (direct_match || known_match) {
+                                        let fresh = verified.is_ok() && (direct_match || known_match) && {
+                                            let mut guard = replay_guard_b.lock()
+                                                .unwrap_or_else(|e| e.into_inner());
+                                            guard.check_and_insert(&envelope.node_id, envelope.nonce)
+                                        };
+                                        if fresh {
                                             if let Ok(inner) = verified {
                                                 let committee = Message::deserialize_committee_selection(&inner);
                                                 if let Ok((members, state_number)) = committee {
