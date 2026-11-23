@@ -13,7 +13,7 @@ impl ValidatorRepository {
     pub async fn register(&self, validator: &ValidatorInfo) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO validators (address, public_key, machine_id, balance, state, enabled_at,
+            INSERT OR REPLACE INTO validators (address, public_key, machine_id, balance, state, enabled_at,
                                     uptime_score, reputation_score, validator_weight, last_seen,
                                     consecutive_uptime_weeks, committees_participated, votes_cast,
                                     votes_correct, endpoint, is_active)
@@ -43,6 +43,21 @@ impl ValidatorRepository {
         Ok(())
     }
 
+    pub async fn get_all(&self) -> Result<Vec<ValidatorInfo>> {
+        let rows = sqlx::query("SELECT * FROM validators")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| XentriumError::DatabaseError(e.to_string()))?;
+
+        let mut validators = Vec::new();
+        for row in rows {
+            if let Some(v) = Self::row_to_validator(&row)? {
+                validators.push(v);
+            }
+        }
+        Ok(validators)
+    }
+
     pub async fn get(&self, address: &Address) -> Result<Option<ValidatorInfo>> {
         let row = sqlx::query("SELECT * FROM validators WHERE address = ?")
             .bind(address)
@@ -51,6 +66,14 @@ impl ValidatorRepository {
             .map_err(|e| XentriumError::DatabaseError(e.to_string()))?;
 
         if let Some(row) = row {
+            Self::row_to_validator(&row)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn row_to_validator(row: &sqlx::sqlite::SqliteRow) -> Result<Option<ValidatorInfo>> {
+        {
             let state_str = row.try_get::<String, _>("state").map_err(|e| XentriumError::DatabaseError(e.to_string()))?;
             let state = match state_str.as_str() {
                 "Active" => xentrium_shared::ValidatorState::Active,
@@ -76,8 +99,6 @@ impl ValidatorRepository {
                 endpoint: row.try_get("endpoint").map_err(|e| XentriumError::DatabaseError(e.to_string()))?,
                 is_active: row.try_get::<i32, _>("is_active").map_err(|e| XentriumError::DatabaseError(e.to_string()))? != 0,
             }))
-        } else {
-            Ok(None)
         }
     }
 

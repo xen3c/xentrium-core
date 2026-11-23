@@ -33,7 +33,27 @@ pub struct NetworkSection {
 pub struct ConsensusSection {
     pub auto_committee_rotation: bool,
     pub snapshot_interval_hours: u64,
+    /// Self-register this node's identity as an active validator on startup.
+    #[serde(default = "default_true")]
+    pub self_register_validator: bool,
+    /// Seconds between self-announcements (validator re-announce + PeerList
+    /// gossip + cached-state re-serve). Keeps signed envelopes fresh.
+    #[serde(default = "default_announce_interval_secs")]
+    pub announce_interval_secs: u64,
+    /// Committee epoch length: the committee rotates deterministically
+    /// every this many seconds.
+    #[serde(default = "default_committee_epoch_secs")]
+    pub committee_epoch_secs: u64,
+    /// Snapshot epoch length: the committee leader produces one snapshot
+    /// per epoch and advertises it for peers to pull.
+    #[serde(default = "default_snapshot_epoch_secs")]
+    pub snapshot_epoch_secs: u64,
 }
+
+fn default_true() -> bool { true }
+fn default_announce_interval_secs() -> u64 { 60 }
+fn default_committee_epoch_secs() -> u64 { 86400 }
+fn default_snapshot_epoch_secs() -> u64 { 86400 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingSection {
@@ -80,6 +100,10 @@ impl Default for ConsensusSection {
         Self {
             auto_committee_rotation: true,
             snapshot_interval_hours: 24,
+            self_register_validator: true,
+            announce_interval_secs: default_announce_interval_secs(),
+            committee_epoch_secs: default_committee_epoch_secs(),
+            snapshot_epoch_secs: default_snapshot_epoch_secs(),
         }
     }
 }

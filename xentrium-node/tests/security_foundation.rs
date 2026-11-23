@@ -7,7 +7,7 @@ fn cfg(node_id: &str, addr: &str, dir: &str, bootstrap: Vec<String>) -> NodeConf
         data_directory: dir.into(), bootstrap_peers: bootstrap,
         max_peers: 50, log_level: "info".into(),
         heartbeat_interval_secs: 30, peer_timeout_secs: 120,
-        allowed_node_ids: vec![],
+        allowed_node_ids: vec![], ..NodeConfig::default()
     }
 }
 

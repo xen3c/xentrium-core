@@ -12,7 +12,7 @@ fn create_node_config(node_id: &str, address: &str, data_dir: &str, hb_interval:
         log_level: "info".to_string(),
         heartbeat_interval_secs: hb_interval,
         peer_timeout_secs: timeout,
-        allowed_node_ids: vec![],
+        allowed_node_ids: vec![], ..NodeConfig::default()
     }
 }
 

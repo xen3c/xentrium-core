@@ -417,6 +417,23 @@ impl Message {
         Ok((state_number, state_hash, snapshot_hash, timestamp, accounts_len, active_validators_len, pending_validators_len, reward_pool_balance, last_reward_distribution, active_proposals_len, proposal_votes_len))
     }
 
+    /// Serialize a SnapshotRequest payload (requested state number)
+    pub fn serialize_snapshot_request(state_number: i64) -> Result<Vec<u8>> {
+        Ok(state_number.to_be_bytes().to_vec())
+    }
+
+    /// Deserialize a SnapshotRequest payload
+    pub fn deserialize_snapshot_request(payload: &[u8]) -> Result<i64> {
+        if payload.len() != 8 {
+            return Err(crate::NetworkError::ProtocolError(
+                "Invalid snapshot request payload".to_string(),
+            ).into());
+        }
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(payload);
+        Ok(i64::from_be_bytes(bytes))
+    }
+
     /// Serialize a full Snapshot for SnapshotData message
     pub fn serialize_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>> {
         // Use bincode for efficient serialization of complex structures

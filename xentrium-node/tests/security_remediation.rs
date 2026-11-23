@@ -24,7 +24,7 @@ fn node_config(node_id: &str, port: u16, bootstrap: Vec<String>, allowed: Vec<St
         log_level: "warn".to_string(),
         heartbeat_interval_secs: 30,
         peer_timeout_secs: 120,
-        allowed_node_ids: allowed,
+        allowed_node_ids: allowed, ..NodeConfig::default()
     }
 }
 

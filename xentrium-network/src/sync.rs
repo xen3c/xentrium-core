@@ -75,6 +75,25 @@ impl BasicSnapshotSync {
         // Simple hash computation for verification
         format!("{}:{}:{}", snapshot.state_number, snapshot.state_hash, snapshot.timestamp)
     }
+
+    /// Canonical snapshot hash — producers must set snapshot_hash to this value
+    /// for receive-side verification to pass.
+    pub fn snapshot_hash_for(state_number: i64, state_hash: &str, timestamp: i64) -> String {
+        format!("{}:{}:{}", state_number, state_hash, timestamp)
+    }
+
+    /// Look up a locally stored snapshot by state number
+    pub fn get_snapshot(&self, state_number: i64) -> Option<Snapshot> {
+        self.local_snapshots.get(&state_number).cloned()
+    }
+
+    /// Latest locally stored snapshot, if any
+    pub fn get_latest_local(&self) -> Option<Snapshot> {
+        self.local_snapshots
+            .values()
+            .max_by_key(|s| s.state_number)
+            .cloned()
+    }
 }
 
 impl SnapshotSync for BasicSnapshotSync {

@@ -76,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_level: "info".to_string(),
         heartbeat_interval_secs: 30,
         peer_timeout_secs: 120,
-        allowed_node_ids: vec![],
+        allowed_node_ids: vec![], ..NodeConfig::default()
     };
 
     let node = Node::new_with_storage(config).await?;

@@ -99,6 +99,11 @@ impl TcpTransport {
         Ok(())
     }
 
+    /// Stop listening — drops the accept socket so the port is released
+    pub fn stop_listener(&mut self) {
+        self.listener = None;
+    }
+
     /// Connect to a remote peer (TLS if enabled)
     pub async fn connect(&self, peer_id: PeerID) -> Result<TcpConnection> {
         let stream = TcpStream::connect(peer_id.endpoint)

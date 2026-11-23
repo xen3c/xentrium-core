@@ -13,7 +13,7 @@ fn create_node_config(node_id: &str, address: &str, bootstrap_peers: Vec<String>
         log_level: "info".to_string(),
         heartbeat_interval_secs: 30,
         peer_timeout_secs: 120,
-        allowed_node_ids: vec![],
+        allowed_node_ids: vec![], ..NodeConfig::default()
     }
 }
 

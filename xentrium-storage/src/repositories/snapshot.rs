@@ -13,7 +13,7 @@ impl SnapshotRepository {
     pub async fn store(&self, snapshot: &Snapshot) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO snapshots (state_number, state_hash, snapshot_hash, timestamp, committee_signature)
+            INSERT OR REPLACE INTO snapshots (state_number, state_hash, snapshot_hash, timestamp, committee_signature)
             VALUES (?, ?, ?, ?, ?)
             "#,
         )

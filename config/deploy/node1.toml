@@ -18,6 +18,10 @@ allowed_node_ids = []
 [consensus]
 auto_committee_rotation = true
 snapshot_interval_hours = 24
+self_register_validator = true
+announce_interval_secs = 30
+committee_epoch_secs = 300
+snapshot_epoch_secs = 300
 
 [logging]
 level = "info"

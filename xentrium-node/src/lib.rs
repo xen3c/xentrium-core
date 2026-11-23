@@ -6,7 +6,7 @@ use tracing::info;
 use xentrium_consensus::ValidatorManager;
 use xentrium_network::{BasicDiscovery, BasicGossip, BasicSnapshotSync, Discovery, TcpTransport, TcpConnection, PeerID, Peer, PeerState, Message, MessageType, NetworkConnection, SnapshotSync, HeartbeatTracker, NodeIdentity, SignedAnnouncement, ReplayGuard, TlsCredentials, TlsTransportConfig, tls_dir};
 use xentrium_storage::{Database, ValidatorRepository, SnapshotRepository, CommitteeRepository, PeerRepository};
-use xentrium_shared::{Result, XentriumError, ValidatorInfo, Snapshot};
+use xentrium_shared::{Result, XentriumError, ValidatorInfo, ValidatorState, Snapshot, MAX_COMMITTEE_SIZE};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -23,7 +23,24 @@ pub struct NodeConfig {
     pub peer_timeout_secs: u64,
     /// Allowed peer node_ids (pubkey-bound identities). Empty = allow all (open testnet).
     pub allowed_node_ids: Vec<String>,
+    /// Self-register this node's identity as an active validator on startup.
+    #[serde(default)]
+    pub self_register_validator: bool,
+    /// Seconds between self-announcements (validator re-announce + PeerList
+    /// gossip + cached-state re-serve).
+    #[serde(default = "default_announce_interval_secs")]
+    pub announce_interval_secs: u64,
+    /// Committee epoch length in seconds — committee rotates deterministically each epoch.
+    #[serde(default = "default_committee_epoch_secs")]
+    pub committee_epoch_secs: u64,
+    /// Snapshot epoch length in seconds — leader produces one snapshot per epoch.
+    #[serde(default = "default_snapshot_epoch_secs")]
+    pub snapshot_epoch_secs: u64,
 }
+
+fn default_announce_interval_secs() -> u64 { 60 }
+fn default_committee_epoch_secs() -> u64 { 86400 }
+fn default_snapshot_epoch_secs() -> u64 { 86400 }
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -37,8 +54,27 @@ impl Default for NodeConfig {
             heartbeat_interval_secs: 30,
             peer_timeout_secs: 120,
             allowed_node_ids: vec![],
+            self_register_validator: false,
+            announce_interval_secs: default_announce_interval_secs(),
+            committee_epoch_secs: default_committee_epoch_secs(),
+            snapshot_epoch_secs: default_snapshot_epoch_secs(),
         }
     }
+}
+
+/// Deterministically derive the committee for an epoch from the active
+/// validator set: sort addresses, rotate by epoch, cap at MAX_COMMITTEE_SIZE.
+/// Every node with the same validator set computes the identical committee.
+pub fn derive_committee(mut validators: Vec<String>, epoch: u64) -> Vec<String> {
+    validators.sort();
+    validators.dedup();
+    if validators.is_empty() {
+        return validators;
+    }
+    let rot = (epoch as usize) % validators.len();
+    validators.rotate_left(rot);
+    validators.truncate(MAX_COMMITTEE_SIZE);
+    validators
 }
 
 /// Node runtime
@@ -63,6 +99,14 @@ pub struct Node {
     replay_guard: Arc<std::sync::Mutex<ReplayGuard>>,
     /// Verified peer announcements available for gossip (H2)
     known_announcements: Arc<RwLock<HashMap<String, SignedAnnouncement>>>,
+    /// Verified peer identities (node_id -> public key) learned from
+    /// handshakes and announcements; used to authenticate relayed envelopes.
+    known_identities: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    /// Validator address -> latest raw signed registration envelope
+    /// (served to newly connected peers and relayed on first sight).
+    validator_envelopes: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    /// Latest committee selection envelope seen (state_number, raw payload).
+    committee_envelope: Arc<RwLock<Option<(i64, Vec<u8>)>>>,
 }
 
 impl Node {
@@ -98,6 +142,8 @@ impl Node {
         let mut known_announcements = HashMap::new();
         let own_ann = identity.sign_announcement(&config.network_address);
         known_announcements.insert(identity.node_id.clone(), own_ann);
+        let mut known_identities = HashMap::new();
+        known_identities.insert(identity.node_id.clone(), identity.public_key_bytes());
 
         Ok(Self {
             config,
@@ -118,6 +164,9 @@ impl Node {
             identity,
             replay_guard: Arc::new(std::sync::Mutex::new(ReplayGuard::new(10_000))),
             known_announcements: Arc::new(RwLock::new(known_announcements)),
+            known_identities: Arc::new(RwLock::new(known_identities)),
+            validator_envelopes: Arc::new(RwLock::new(HashMap::new())),
+            committee_envelope: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -135,6 +184,11 @@ impl Node {
         let transport = Arc::new(RwLock::new(TcpTransport::new()));
         let connections: Arc<RwLock<HashMap<std::net::SocketAddr, TcpConnection>>> = Arc::new(RwLock::new(HashMap::new()));
         let pong_received = Arc::new(AtomicBool::new(false));
+
+        // Ensure the data directory exists before SQLite touches it
+        std::fs::create_dir_all(&config.data_directory)
+            .map_err(|e| XentriumError::DatabaseError(
+                format!("Failed to create data directory: {}", e)))?;
 
         // Initialize storage - use file-based SQLite with WAL mode for better concurrency
         let db_path = format!("{}/xentrium.db", config.data_directory);
@@ -155,6 +209,8 @@ impl Node {
         let mut known_announcements = HashMap::new();
         let own_ann = identity.sign_announcement(&config.network_address);
         known_announcements.insert(identity.node_id.clone(), own_ann);
+        let mut known_identities = HashMap::new();
+        known_identities.insert(identity.node_id.clone(), identity.public_key_bytes());
 
         Ok(Self {
             config,
@@ -175,6 +231,9 @@ impl Node {
             identity,
             replay_guard: Arc::new(std::sync::Mutex::new(ReplayGuard::new(10_000))),
             known_announcements: Arc::new(RwLock::new(known_announcements)),
+            known_identities: Arc::new(RwLock::new(known_identities)),
+            validator_envelopes: Arc::new(RwLock::new(HashMap::new())),
+            committee_envelope: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -218,7 +277,73 @@ impl Node {
         // Start background networking tasks
         self.start_networking_tasks().await?;
 
+        // Self-register as validator and announce to already-connected peers
+        self.autonomous_bootstrap().await?;
+
         info!("Node started successfully: {}", self.config.node_id);
+        Ok(())
+    }
+
+    /// ValidatorInfo describing this node's own identity as a validator.
+    fn self_validator_info(&self) -> ValidatorInfo {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        ValidatorInfo {
+            address: self.identity.node_id.clone(),
+            public_key: self.identity.public_key_bytes(),
+            machine_id: self.config.node_id.clone(),
+            balance: 0,
+            state: ValidatorState::Active,
+            enabled_at: Some(now),
+            uptime_score: 100,
+            reputation_score: 0,
+            validator_weight: 0.0,
+            last_seen: now,
+            consecutive_uptime_weeks: 0,
+            committees_participated: 0,
+            votes_cast: 0,
+            votes_correct: 0,
+            endpoint: self.config.network_address.clone(),
+            is_active: true,
+        }
+    }
+
+    /// Sign and broadcast a fresh validator registration envelope, caching the
+    /// raw payload so it can be served to peers that connect later.
+    async fn announce_validator(&self, validator: &ValidatorInfo) {
+        let Ok(inner) = Message::serialize_validator_registration(validator) else {
+            return;
+        };
+        let envelope = self.identity.sign_envelope("xnt-validator-registration", &inner);
+        let Ok(payload) = Message::serialize_signed_envelope(&envelope) else {
+            return;
+        };
+        self.validator_envelopes.write().await
+            .insert(validator.address.clone(), payload.clone());
+        let msg = Message::new(
+            MessageType::ValidatorRegistration,
+            self.config.node_id.clone().into_bytes(),
+            payload,
+        );
+        let _ = self.broadcast_message(msg).await;
+    }
+
+    /// Autonomous startup: self-register as an active validator, persist, and
+    /// announce to any peers already connected.
+    async fn autonomous_bootstrap(&self) -> Result<()> {
+        if !self.config.self_register_validator {
+            return Ok(());
+        }
+        let validator = self.self_validator_info();
+        {
+            let mut vm = self.validator_manager.write().await;
+            let _ = vm.register_validator_from_network(validator.clone());
+        }
+        let _ = self.persist_validator(&validator).await;
+        self.announce_validator(&validator).await;
+        info!("Self-registered as validator: {}", validator.address);
         Ok(())
     }
 
@@ -236,6 +361,12 @@ impl Node {
         {
             let mut connections = self.connections.write().await;
             connections.clear();
+        }
+
+        // Release the listening socket so a restarted node can rebind
+        {
+            let mut transport = self.transport.write().await;
+            transport.stop_listener();
         }
 
         // Close database connection if storage is enabled
@@ -450,10 +581,15 @@ impl Node {
             (&self.validator_repository, &self.snapshot_repository, &self.committee_repository, &self.peer_repository) {
             
             // Load validators
-            if let Ok(Some(validator)) = validator_repo.get(&"test_validator".to_string()).await {
+            if let Ok(validators) = validator_repo.get_all().await {
+                let count = validators.len();
                 let mut vm = self.validator_manager.write().await;
-                let _ = vm.register_validator_from_network(validator);
-                info!("Loaded validator from storage");
+                for validator in validators {
+                    let _ = vm.register_validator_from_network(validator);
+                }
+                if count > 0 {
+                    info!("Loaded {} validators from storage", count);
+                }
             }
 
             // Load latest snapshot
@@ -727,6 +863,12 @@ impl Node {
         let replay_guard_b = self.replay_guard.clone();
         let known_announcements_b = self.known_announcements.clone();
         let allowed_node_ids_b = self.config.allowed_node_ids.clone();
+        let known_identities_b = self.known_identities.clone();
+        let validator_envelopes_b = self.validator_envelopes.clone();
+        let committee_envelope_b = self.committee_envelope.clone();
+        let validator_repo_b = self.validator_repository.clone();
+        let committee_repo_b = self.committee_repository.clone();
+        let snapshot_repo_b = self.snapshot_repository.clone();
 
         let running_hb = self.running.clone();
         let connections_hb = self.connections.clone();
@@ -743,6 +885,45 @@ impl Node {
 
         let running_sa = self.running.clone();
         let snapshot_sync_sa = self.snapshot_sync.clone();
+
+        // Autonomous-operation clones
+        let running_an = self.running.clone();
+        let connections_an = self.connections.clone();
+        let identity_an = self.identity.clone();
+        let node_id_an = self.config.node_id.clone();
+        let known_announcements_an = self.known_announcements.clone();
+        let validator_envelopes_an = self.validator_envelopes.clone();
+        let committee_envelope_an = self.committee_envelope.clone();
+        let snapshot_sync_an = self.snapshot_sync.clone();
+        let announce_interval_an = self.config.announce_interval_secs.max(5);
+        let self_validator_an = if self.config.self_register_validator {
+            Some(self.self_validator_info())
+        } else {
+            None
+        };
+
+        let running_cm = self.running.clone();
+        let validator_manager_cm = self.validator_manager.clone();
+        let committee_repo_cm = self.committee_repository.clone();
+        let committee_envelope_cm = self.committee_envelope.clone();
+        let connections_cm = self.connections.clone();
+        let identity_cm = self.identity.clone();
+        let node_id_cm = self.config.node_id.clone();
+        let own_validator_addr_cm = self.identity.node_id.clone();
+        let committee_epoch_cm = self.config.committee_epoch_secs.max(1);
+        let committee_enabled_cm = self.config.self_register_validator;
+        let committee_poll_cm = (self.config.committee_epoch_secs / 4).clamp(2, 30);
+
+        let running_sp = self.running.clone();
+        let validator_manager_sp = self.validator_manager.clone();
+        let snapshot_sync_sp = self.snapshot_sync.clone();
+        let snapshot_repo_sp = self.snapshot_repository.clone();
+        let connections_sp = self.connections.clone();
+        let node_id_sp = self.config.node_id.clone();
+        let own_validator_addr_sp = self.identity.node_id.clone();
+        let snapshot_epoch_sp = self.config.snapshot_epoch_secs.max(1);
+        let snapshot_enabled_sp = self.config.self_register_validator;
+        let snapshot_poll_sp = (self.config.snapshot_epoch_secs / 4).clamp(2, 30);
 
         // Spawn accept loop task
         tokio::spawn(async move {
@@ -915,6 +1096,9 @@ impl Node {
                 };
                 
                 for addr in addrs {
+                    // Deferred sends: Some(peer) = direct reply, None = relay to
+                    // all connections except the source `addr`.
+                    let mut outbox: Vec<(Option<std::net::SocketAddr>, Message)> = Vec::new();
                     let mut connections = connections_b.write().await;
                     if let Some(connection) = connections.get_mut(&addr) {
                         match tokio::time::timeout(
@@ -953,6 +1137,44 @@ impl Node {
                                                     let ann = NodeIdentity::announcement_from_handshake(&payload);
                                                     known_announcements_b.write().await
                                                         .insert(payload.node_id.clone(), ann);
+                                                    // Record verified identity so envelopes relayed
+                                                    // through third parties can be authenticated
+                                                    known_identities_b.write().await
+                                                        .insert(payload.node_id.clone(), payload.public_key.clone());
+
+                                                    // Autonomous sync: serve cached network state to
+                                                    // the newly verified peer
+                                                    let raw_envs: Vec<Vec<u8>> = validator_envelopes_b
+                                                        .read().await.values().cloned().collect();
+                                                    for raw in raw_envs {
+                                                        let _ = connection.send(Message::new(
+                                                            MessageType::ValidatorRegistration,
+                                                            node_id_b.clone().into_bytes(),
+                                                            raw,
+                                                        )).await;
+                                                    }
+                                                    if let Some((_, raw)) = committee_envelope_b
+                                                        .read().await.clone()
+                                                    {
+                                                        let _ = connection.send(Message::new(
+                                                            MessageType::CommitteeSelection,
+                                                            node_id_b.clone().into_bytes(),
+                                                            raw,
+                                                        )).await;
+                                                    }
+                                                    let latest_snap = {
+                                                        let sync = snapshot_sync_b.read().await;
+                                                        sync.get_latest_local()
+                                                    };
+                                                    if let Some(snap) = latest_snap {
+                                                        if let Ok(meta) = Message::serialize_snapshot_metadata(&snap) {
+                                                            let _ = connection.send(Message::new(
+                                                                MessageType::SnapshotOffer,
+                                                                node_id_b.clone().into_bytes(),
+                                                                meta,
+                                                            )).await;
+                                                        }
+                                                    }
                                                 }
                                                 _ => {
                                                     info!("Rejecting peer {:?}: invalid handshake, cert/identity mismatch, not allowlisted, or replay", addr);
@@ -1033,9 +1255,12 @@ impl Node {
                                             let added = discovery.receive_peer_list(peers.clone());
                                             info!("PeerList: {} valid announcements, added {} peers", valid_anns.len(), added.unwrap_or(0));
                                             drop(discovery);
-                                            // Cache verified announcements for relay
+                                            // Cache verified announcements for relay and record
+                                            // their identities so relayed envelopes authenticate
                                             let mut known = known_announcements_b.write().await;
+                                            let mut known_ids = known_identities_b.write().await;
                                             for ann in valid_anns {
+                                                known_ids.insert(ann.node_id.clone(), ann.public_key.clone());
                                                 known.insert(ann.node_id.clone(), ann);
                                             }
                                         }
@@ -1057,18 +1282,39 @@ impl Node {
                                             guard.check_and_insert(&envelope.node_id, envelope.nonce)
                                         };
                                         // C3: envelope identity must match this connection's
-                                        // authenticated handshake identity
-                                        let auth_match = connection.auth_node_id.as_deref()
+                                        // authenticated identity — OR an identity already
+                                        // verified via handshake/announcement gossip, which
+                                        // permits signed envelopes relayed through the seed.
+                                        let direct_match = connection.auth_node_id.as_deref()
                                             == Some(envelope.node_id.as_str())
                                             && connection.auth_pubkey.as_deref()
                                                 == Some(envelope.public_key.as_slice());
-                                        if fresh && auth_match {
+                                        let known_match = {
+                                            let known = known_identities_b.read().await;
+                                            known.get(&envelope.node_id)
+                                                .map(|pk| pk == &envelope.public_key)
+                                                .unwrap_or(false)
+                                        };
+                                        if fresh && (direct_match || known_match) {
                                             if let Ok(inner) = verified {
                                                 let validator = Message::deserialize_validator_registration(&inner);
                                                 if let Ok(validator_info) = validator {
-                                                    let mut vm = validator_manager_b.write().await;
-                                                    let _ = vm.register_validator_from_network(validator_info.clone());
+                                                    let is_new = !validator_envelopes_b.read().await
+                                                        .contains_key(&validator_info.address);
+                                                    {
+                                                        let mut vm = validator_manager_b.write().await;
+                                                        let _ = vm.register_validator_from_network(validator_info.clone());
+                                                    }
+                                                    validator_envelopes_b.write().await
+                                                        .insert(validator_info.address.clone(), message.payload.clone());
                                                     info!("Registered validator: {} (signed by {})", validator_info.address, envelope.node_id);
+                                                    if is_new {
+                                                        if let Some(ref repo) = validator_repo_b {
+                                                            let _ = repo.register(&validator_info).await;
+                                                        }
+                                                        // Relay so indirectly connected peers learn it
+                                                        outbox.push((None, message.clone()));
+                                                    }
                                                 }
                                             }
                                         } else {
@@ -1091,17 +1337,45 @@ impl Node {
                                                 .unwrap_or_else(|e| e.into_inner());
                                             guard.check_and_insert(&envelope.node_id, envelope.nonce)
                                         };
-                                        let auth_match = connection.auth_node_id.as_deref()
+                                        let direct_match = connection.auth_node_id.as_deref()
                                             == Some(envelope.node_id.as_str())
                                             && connection.auth_pubkey.as_deref()
                                                 == Some(envelope.public_key.as_slice());
-                                        if fresh && auth_match {
+                                        let known_match = {
+                                            let known = known_identities_b.read().await;
+                                            known.get(&envelope.node_id)
+                                                .map(|pk| pk == &envelope.public_key)
+                                                .unwrap_or(false)
+                                        };
+                                        if fresh && (direct_match || known_match) {
                                             if let Ok(inner) = verified {
                                                 let committee = Message::deserialize_committee_selection(&inner);
                                                 if let Ok((members, state_number)) = committee {
-                                                    let mut vm = validator_manager_b.write().await;
-                                                    vm.update_committee(&members, state_number);
-                                                    info!("Updated committee with {} members for state {} (signed by {})", members.len(), state_number, envelope.node_id);
+                                                    let is_newer = {
+                                                        let mut vm = validator_manager_b.write().await;
+                                                        if state_number >= vm.state_number() {
+                                                            vm.update_committee(&members, state_number);
+                                                            info!("Updated committee with {} members for state {} (signed by {})", members.len(), state_number, envelope.node_id);
+                                                            true
+                                                        } else {
+                                                            false
+                                                        }
+                                                    };
+                                                    // Cache latest selection for serving/relaying
+                                                    let newer_than_cache = committee_envelope_b.read().await
+                                                        .as_ref()
+                                                        .map(|(sn, _)| state_number > *sn)
+                                                        .unwrap_or(true);
+                                                    if newer_than_cache {
+                                                        *committee_envelope_b.write().await =
+                                                            Some((state_number, message.payload.clone()));
+                                                        if is_newer {
+                                                            if let Some(ref repo) = committee_repo_b {
+                                                                let _ = repo.store(&members, state_number).await;
+                                                            }
+                                                            outbox.push((None, message.clone()));
+                                                        }
+                                                    }
                                                 }
                                             }
                                         } else {
@@ -1112,32 +1386,80 @@ impl Node {
                                     }
                                 }
 
-                                // Handle SnapshotOffer
+                                // Handle SnapshotOffer -> pull the snapshot if newer
                                 if message.message_type == MessageType::SnapshotOffer {
                                     info!("Processing SnapshotOffer from {:?}", addr);
                                     let metadata = Message::deserialize_snapshot_metadata(&message.payload);
                                     if let Ok((state_number, _, _, _, _, _, _, _, _, _, _)) = metadata {
-                                        let sync = snapshot_sync_b.read().await;
-                                        let current_state = sync.get_current_state_number();
+                                        let current_state = {
+                                            let sync = snapshot_sync_b.read().await;
+                                            sync.get_current_state_number()
+                                        };
                                         if state_number > current_state {
-                                            info!("Received newer snapshot offer: state {}", state_number);
+                                            info!("Received newer snapshot offer: state {} — requesting from {:?}", state_number, addr);
+                                            let peer = PeerID::new(
+                                                format!("peer-{}", addr), addr, addr.to_string());
+                                            {
+                                                let mut sync = snapshot_sync_b.write().await;
+                                                let _ = sync.request_snapshot(peer, state_number);
+                                            }
+                                            if let Ok(req) = Message::serialize_snapshot_request(state_number) {
+                                                outbox.push((Some(addr), Message::new(
+                                                    MessageType::SnapshotRequest,
+                                                    node_id_b.clone().into_bytes(),
+                                                    req,
+                                                )));
+                                            }
                                         }
                                     }
                                 }
 
-                                // Handle SnapshotRequest
+                                // Handle SnapshotRequest -> serve stored snapshot data
                                 if message.message_type == MessageType::SnapshotRequest {
                                     info!("Processing SnapshotRequest from {:?}", addr);
+                                    if let Ok(state_number) = Message::deserialize_snapshot_request(&message.payload) {
+                                        let snap = {
+                                            let sync = snapshot_sync_b.read().await;
+                                            sync.get_snapshot(state_number)
+                                        };
+                                        if let Some(snap) = snap {
+                                            if let Ok(data) = Message::serialize_snapshot(&snap) {
+                                                outbox.push((Some(addr), Message::new(
+                                                    MessageType::SnapshotData,
+                                                    node_id_b.clone().into_bytes(),
+                                                    data,
+                                                )));
+                                            }
+                                        } else {
+                                            info!("SnapshotRequest for state {} — not stored locally", state_number);
+                                        }
+                                    }
                                 }
 
-                                // Handle SnapshotData
+                                // Handle SnapshotData -> verify, install, persist, re-offer
                                 if message.message_type == MessageType::SnapshotData {
                                     info!("Processing SnapshotData from {:?}", addr);
                                     let snapshot = Message::deserialize_snapshot(&message.payload);
                                     if let Ok(snap) = snapshot {
-                                        let mut sync = snapshot_sync_b.write().await;
-                                        let _ = sync.receive_snapshot(snap);
-                                        info!("Received and stored snapshot");
+                                        let installed = {
+                                            let mut sync = snapshot_sync_b.write().await;
+                                            sync.receive_snapshot(snap.clone()).is_ok()
+                                        };
+                                        if installed {
+                                            info!("Received and stored snapshot: state {}", snap.state_number);
+                                            if let Some(ref repo) = snapshot_repo_b {
+                                                let _ = repo.store(&snap).await;
+                                            }
+                                            // Re-offer so peers that missed the original
+                                            // advertisement can also pull it from us.
+                                            if let Ok(meta) = Message::serialize_snapshot_metadata(&snap) {
+                                                outbox.push((None, Message::new(
+                                                    MessageType::SnapshotOffer,
+                                                    node_id_b.clone().into_bytes(),
+                                                    meta,
+                                                )));
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1150,6 +1472,24 @@ impl Node {
                             }
                             Err(_) => {
                                 // Timeout - normal
+                            }
+                        }
+                    }
+
+                    // Flush deferred sends (direct replies + relays)
+                    for (target, msg) in outbox.drain(..) {
+                        match target {
+                            Some(t) => {
+                                if let Some(c) = connections.get_mut(&t) {
+                                    let _ = c.send(msg).await;
+                                }
+                            }
+                            None => {
+                                for (a, c) in connections.iter_mut() {
+                                    if *a != addr {
+                                        let _ = c.send(msg.clone()).await;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1294,6 +1634,252 @@ impl Node {
                 let snapshot_sync = snapshot_sync_sa.read().await;
                 let available = snapshot_sync.get_available_snapshots();
                 info!("Snapshot advertisement: {} available snapshots", available.len());
+            }
+        });
+
+        // Autonomous announce task: periodically re-announce our own validator
+        // (fresh envelope keeps relay caches within the freshness window),
+        // gossip the PeerList, and re-serve cached state so late joiners and
+        // peers that missed earlier broadcasts still converge.
+        tokio::spawn(async move {
+            loop {
+                if !*running_an.read().await {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(announce_interval_an)).await;
+
+                // 1) Re-announce own validator with a fresh envelope
+                if let Some(ref validator) = self_validator_an {
+                    if let Ok(inner) = Message::serialize_validator_registration(validator) {
+                        let envelope = identity_an.sign_envelope("xnt-validator-registration", &inner);
+                        if let Ok(payload) = Message::serialize_signed_envelope(&envelope) {
+                            validator_envelopes_an.write().await
+                                .insert(validator.address.clone(), payload.clone());
+                            let msg = Message::new(
+                                MessageType::ValidatorRegistration,
+                                node_id_an.clone().into_bytes(),
+                                payload,
+                            );
+                            let mut connections = connections_an.write().await;
+                            for (_, c) in connections.iter_mut() {
+                                let _ = c.send(msg.clone()).await;
+                            }
+                        }
+                    }
+                }
+
+                // 2) Broadcast PeerList (verified announcements) so peers learn
+                //    identities needed to authenticate relayed envelopes
+                let announcements: Vec<SignedAnnouncement> = {
+                    let known = known_announcements_an.read().await;
+                    known.values().take(64).cloned().collect()
+                };
+                if let Ok(payload) = Message::serialize_announcements(&announcements) {
+                    let msg = Message::new(
+                        MessageType::PeerList,
+                        node_id_an.clone().into_bytes(),
+                        payload,
+                    );
+                    let mut connections = connections_an.write().await;
+                    for (_, c) in connections.iter_mut() {
+                        let _ = c.send(msg.clone()).await;
+                    }
+                }
+
+                // 3) Re-serve cached validator envelopes + committee selection
+                //    + latest snapshot offer (state sync beacon)
+                let cached: Vec<Vec<u8>> = {
+                    validator_envelopes_an.read().await.values().cloned().collect()
+                };
+                let committee_raw = committee_envelope_an.read().await.clone();
+                let latest_snap = {
+                    let sync = snapshot_sync_an.read().await;
+                    sync.get_latest_local()
+                };
+                let mut connections = connections_an.write().await;
+                for (_, c) in connections.iter_mut() {
+                    for raw in &cached {
+                        let _ = c.send(Message::new(
+                            MessageType::ValidatorRegistration,
+                            node_id_an.clone().into_bytes(),
+                            raw.clone(),
+                        )).await;
+                    }
+                    if let Some((_, ref raw)) = committee_raw {
+                        let _ = c.send(Message::new(
+                            MessageType::CommitteeSelection,
+                            node_id_an.clone().into_bytes(),
+                            raw.clone(),
+                        )).await;
+                    }
+                    if let Some(ref snap) = latest_snap {
+                        if let Ok(meta) = Message::serialize_snapshot_metadata(snap) {
+                            let _ = c.send(Message::new(
+                                MessageType::SnapshotOffer,
+                                node_id_an.clone().into_bytes(),
+                                meta,
+                            )).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Autonomous committee task: every epoch, deterministically derive the
+        // committee from the active validator set (same input -> same output on
+        // every node). The first member broadcasts the signed selection.
+        tokio::spawn(async move {
+            loop {
+                if !*running_cm.read().await {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(committee_poll_cm)).await;
+                if !committee_enabled_cm {
+                    continue;
+                }
+
+                let epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() / committee_epoch_cm;
+
+                let mut vm = validator_manager_cm.write().await;
+                let active: Vec<String> = vm.get_active_validators()
+                    .iter().map(|v| v.address.clone()).collect();
+                let members = derive_committee(active, epoch);
+                if members.is_empty() {
+                    continue;
+                }
+
+                let changed = vm.get_current_committee()
+                    .map(|c| c.state_number < epoch as i64 || c.members != members)
+                    .unwrap_or(true);
+                if !changed {
+                    continue;
+                }
+
+                vm.update_committee(&members, epoch as i64);
+                drop(vm);
+                info!("Committee formed: {} members (epoch {}, leader {})",
+                    members.len(), epoch, members[0]);
+
+                if let Some(ref repo) = committee_repo_cm {
+                    let _ = repo.store(&members, epoch as i64).await;
+                }
+
+                // Leader (first member post-rotation) broadcasts the signed
+                // selection; other nodes already applied the same derivation.
+                if members.first().map(|m| m.as_str()) == Some(own_validator_addr_cm.as_str()) {
+                    if let Ok(inner) = Message::serialize_committee_selection(&members, epoch as i64) {
+                        let envelope = identity_cm.sign_envelope("xnt-committee-selection", &inner);
+                        if let Ok(payload) = Message::serialize_signed_envelope(&envelope) {
+                            *committee_envelope_cm.write().await =
+                                Some((epoch as i64, payload.clone()));
+                            let msg = Message::new(
+                                MessageType::CommitteeSelection,
+                                node_id_cm.clone().into_bytes(),
+                                payload,
+                            );
+                            let mut connections = connections_cm.write().await;
+                            for (_, c) in connections.iter_mut() {
+                                let _ = c.send(msg.clone()).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Autonomous snapshot task: the committee leader produces one snapshot
+        // per epoch, persists + serves it locally, and advertises it. Peers
+        // pull the data via SnapshotRequest.
+        tokio::spawn(async move {
+            loop {
+                if !*running_sp.read().await {
+                    break;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(snapshot_poll_sp)).await;
+                if !snapshot_enabled_sp {
+                    continue;
+                }
+
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let snap_state = (now / snapshot_epoch_sp) as i64;
+
+                // Producer = current committee leader
+                let leader = {
+                    let vm = validator_manager_sp.read().await;
+                    vm.get_committee_members().first().cloned()
+                };
+                if leader.as_deref() != Some(own_validator_addr_sp.as_str()) {
+                    continue;
+                }
+
+                let (produce, committee, active, pending) = {
+                    let sync = snapshot_sync_sp.read().await;
+                    let vm = validator_manager_sp.read().await;
+                    (
+                        snap_state > sync.get_current_state_number(),
+                        vm.get_committee_members(),
+                        vm.get_active_validators().iter().map(|v| v.address.clone()).collect::<Vec<_>>(),
+                        vm.get_pending_validators().iter().map(|v| v.address.clone()).collect::<Vec<_>>(),
+                    )
+                };
+                if !produce {
+                    continue;
+                }
+
+                // Deterministic state hash over epoch + committee + validators
+                let mut h: u64 = 0xcbf29ce484222325;
+                let mut mix = |s: &str| {
+                    for b in s.as_bytes() {
+                        h ^= *b as u64;
+                        h = h.wrapping_mul(0x100000001b3);
+                    }
+                };
+                mix(&snap_state.to_string());
+                for m in &committee { mix(m); }
+                for v in &active { mix(v); }
+                let state_hash = format!("{:016x}", h);
+                let ts = now as i64;
+                let snapshot = xentrium_shared::Snapshot {
+                    state_number: snap_state,
+                    state_hash: state_hash.clone(),
+                    snapshot_hash: xentrium_network::BasicSnapshotSync::snapshot_hash_for(
+                        snap_state, &state_hash, ts),
+                    timestamp: ts,
+                    accounts: std::collections::HashMap::new(),
+                    active_validators: active,
+                    pending_validators: pending,
+                    reward_pool_balance: 0,
+                    last_reward_distribution: 0,
+                    active_proposals: vec![],
+                    proposal_votes: std::collections::HashMap::new(),
+                    committee_signature: None,
+                };
+
+                {
+                    let mut sync = snapshot_sync_sp.write().await;
+                    let _ = sync.serve_snapshot(snapshot.clone());
+                }
+                if let Some(ref repo) = snapshot_repo_sp {
+                    let _ = repo.store(&snapshot).await;
+                }
+                if let Ok(meta) = Message::serialize_snapshot_metadata(&snapshot) {
+                    info!("Produced snapshot for state {} — advertising", snap_state);
+                    let msg = Message::new(
+                        MessageType::SnapshotOffer,
+                        node_id_sp.clone().into_bytes(),
+                        meta,
+                    );
+                    let mut connections = connections_sp.write().await;
+                    for (_, c) in connections.iter_mut() {
+                        let _ = c.send(msg.clone()).await;
+                    }
+                }
             }
         });
 

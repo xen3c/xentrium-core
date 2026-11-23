@@ -96,6 +96,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         heartbeat_interval_secs: toml_config.network.heartbeat_interval_secs,
         peer_timeout_secs: toml_config.network.connection_timeout_secs,
         allowed_node_ids: toml_config.network.allowed_node_ids.clone(),
+        self_register_validator: toml_config.consensus.self_register_validator,
+        announce_interval_secs: toml_config.consensus.announce_interval_secs,
+        committee_epoch_secs: toml_config.consensus.committee_epoch_secs,
+        snapshot_epoch_secs: toml_config.consensus.snapshot_epoch_secs,
     };
 
     // Create node
