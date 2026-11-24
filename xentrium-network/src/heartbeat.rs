@@ -234,6 +234,27 @@ impl HeartbeatTracker {
         self.peers.get(peer_id)
     }
 
+    /// Mean of all tracked peers' average RTTs (None when no data yet).
+    pub fn average_rtt(&self) -> Option<Duration> {
+        let mut sum = Duration::ZERO;
+        let mut n = 0u32;
+        for l in self.peers.values() {
+            if let Some(avg) = l.avg_latency {
+                sum += avg;
+                n += 1;
+            }
+        }
+        (n > 0).then(|| sum / n)
+    }
+
+    /// Per-peer last RTT for metrics.
+    pub fn peer_rtts(&self) -> Vec<(PeerID, Duration)> {
+        self.peers
+            .values()
+            .filter_map(|l| l.last_latency.map(|d| (l.peer_id.clone(), d)))
+            .collect()
+    }
+
     /// Number of tracked peers
     pub fn len(&self) -> usize {
         self.peers.len()

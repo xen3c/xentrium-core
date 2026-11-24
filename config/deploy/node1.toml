@@ -22,6 +22,10 @@ self_register_validator = true
 announce_interval_secs = 30
 committee_epoch_secs = 300
 snapshot_epoch_secs = 300
+# Hardening: cap committee size, bound snapshot storage, expose /metrics
+committee_max_size = 51
+snapshot_retention = 20
+metrics_port = 9101
 
 [logging]
 level = "info"

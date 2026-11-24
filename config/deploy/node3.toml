@@ -23,6 +23,9 @@ self_register_validator = true
 announce_interval_secs = 30
 committee_epoch_secs = 300
 snapshot_epoch_secs = 300
+committee_max_size = 51
+snapshot_retention = 20
+metrics_port = 9103
 
 [logging]
 level = "info"

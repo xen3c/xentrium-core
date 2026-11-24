@@ -32,6 +32,9 @@ fn node_config(node_id: &str, port: u16, tag: &str, bootstrap: Vec<String>) -> N
         announce_interval_secs: 5,
         committee_epoch_secs: 8,
         snapshot_epoch_secs: 8,
+        committee_max_size: 51,
+        snapshot_retention: 10,
+        metrics_port: 0,
     }
 }
 
@@ -229,14 +232,14 @@ fn test_derive_committee_deterministic() {
         "xnt-bbb".to_string(),
     ];
     // Same input -> same output regardless of order
-    let a = derive_committee(validators.clone(), 0);
+    let a = derive_committee(validators.clone(), 0, 51);
     let mut shuffled = validators.clone();
     shuffled.reverse();
-    let b = derive_committee(shuffled, 0);
+    let b = derive_committee(shuffled, 0, 51);
     assert_eq!(a, b);
     assert_eq!(a.len(), 3);
     // Rotation: epoch shifts leadership deterministically
-    let epoch1 = derive_committee(validators.clone(), 1);
+    let epoch1 = derive_committee(validators.clone(), 1, 51);
     assert_eq!(a.len(), epoch1.len());
     assert_ne!(a[0], epoch1[0], "rotation should change the leader");
     // Rotation is a permutation — same membership
@@ -246,5 +249,9 @@ fn test_derive_committee_deterministic() {
     sorted_e1.sort();
     assert_eq!(sorted_a, sorted_e1);
     // Empty set -> empty committee
-    assert!(derive_committee(vec![], 0).is_empty());
+    assert!(derive_committee(vec![], 0, 51).is_empty());
+    // Cap truncates deterministically
+    let capped = derive_committee(validators.clone(), 0, 2);
+    assert_eq!(capped.len(), 2);
+    assert!(a.contains(&capped[0]) && a.contains(&capped[1]));
 }

@@ -100,6 +100,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         announce_interval_secs: toml_config.consensus.announce_interval_secs,
         committee_epoch_secs: toml_config.consensus.committee_epoch_secs,
         snapshot_epoch_secs: toml_config.consensus.snapshot_epoch_secs,
+        committee_max_size: toml_config.consensus.committee_max_size,
+        snapshot_retention: toml_config.consensus.snapshot_retention,
+        metrics_port: toml_config.consensus.metrics_port,
     };
 
     // Create node

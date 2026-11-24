@@ -38,6 +38,9 @@ fn node_config(node_id: &str, port: u16, tag: &str, bootstrap: Vec<String>) -> N
         announce_interval_secs: 5,
         committee_epoch_secs: 8,
         snapshot_epoch_secs: 8,
+        committee_max_size: 51,
+        snapshot_retention: 10,
+        metrics_port: 0,
     }
 }
 

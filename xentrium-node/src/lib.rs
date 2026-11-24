@@ -1,6 +1,8 @@
 pub mod config;
+pub mod metrics;
 
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::info;
 use xentrium_consensus::ValidatorManager;
@@ -36,11 +38,23 @@ pub struct NodeConfig {
     /// Snapshot epoch length in seconds — leader produces one snapshot per epoch.
     #[serde(default = "default_snapshot_epoch_secs")]
     pub snapshot_epoch_secs: u64,
+    /// Max committee members (deterministic rotation selects a capped
+    /// subset of the validator set). Must match fleet-wide.
+    #[serde(default = "default_committee_max_size")]
+    pub committee_max_size: usize,
+    /// Keep at most this many snapshots locally + in storage (0 = unbounded).
+    #[serde(default = "default_snapshot_retention")]
+    pub snapshot_retention: usize,
+    /// Prometheus /metrics HTTP port (0 = disabled).
+    #[serde(default)]
+    pub metrics_port: u16,
 }
 
 fn default_announce_interval_secs() -> u64 { 60 }
 fn default_committee_epoch_secs() -> u64 { 86400 }
 fn default_snapshot_epoch_secs() -> u64 { 86400 }
+fn default_committee_max_size() -> usize { MAX_COMMITTEE_SIZE }
+fn default_snapshot_retention() -> usize { 10 }
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -58,14 +72,18 @@ impl Default for NodeConfig {
             announce_interval_secs: default_announce_interval_secs(),
             committee_epoch_secs: default_committee_epoch_secs(),
             snapshot_epoch_secs: default_snapshot_epoch_secs(),
+            committee_max_size: default_committee_max_size(),
+            snapshot_retention: default_snapshot_retention(),
+            metrics_port: 0,
         }
     }
 }
 
 /// Deterministically derive the committee for an epoch from the active
-/// validator set: sort addresses, rotate by epoch, cap at MAX_COMMITTEE_SIZE.
-/// Every node with the same validator set computes the identical committee.
-pub fn derive_committee(mut validators: Vec<String>, epoch: u64) -> Vec<String> {
+/// validator set: sort addresses, rotate by epoch, cap at `cap` members.
+/// Every node with the same validator set and cap computes the
+/// identical committee.
+pub fn derive_committee(mut validators: Vec<String>, epoch: u64, cap: usize) -> Vec<String> {
     validators.sort();
     validators.dedup();
     if validators.is_empty() {
@@ -73,7 +91,7 @@ pub fn derive_committee(mut validators: Vec<String>, epoch: u64) -> Vec<String> 
     }
     let rot = (epoch as usize) % validators.len();
     validators.rotate_left(rot);
-    validators.truncate(MAX_COMMITTEE_SIZE);
+    validators.truncate(cap);
     validators
 }
 
@@ -120,7 +138,11 @@ impl Node {
         // Initialize network services
         let discovery = Arc::new(RwLock::new(BasicDiscovery::new()));
         let gossip = Arc::new(RwLock::new(BasicGossip::new()));
-        let snapshot_sync = Arc::new(RwLock::new(BasicSnapshotSync::new(0)));
+        let snapshot_sync = Arc::new(RwLock::new({
+            let mut s = BasicSnapshotSync::new(0);
+            s.set_retention(config.snapshot_retention);
+            s
+        }));
         let transport = Arc::new(RwLock::new(TcpTransport::new()));
         let connections: Arc<RwLock<HashMap<std::net::SocketAddr, TcpConnection>>> = Arc::new(RwLock::new(HashMap::new()));
         let pong_received = Arc::new(AtomicBool::new(false));
@@ -180,7 +202,11 @@ impl Node {
         // Initialize network services
         let discovery = Arc::new(RwLock::new(BasicDiscovery::new()));
         let gossip = Arc::new(RwLock::new(BasicGossip::new()));
-        let snapshot_sync = Arc::new(RwLock::new(BasicSnapshotSync::new(0)));
+        let snapshot_sync = Arc::new(RwLock::new({
+            let mut s = BasicSnapshotSync::new(0);
+            s.set_retention(config.snapshot_retention);
+            s
+        }));
         let transport = Arc::new(RwLock::new(TcpTransport::new()));
         let connections: Arc<RwLock<HashMap<std::net::SocketAddr, TcpConnection>>> = Arc::new(RwLock::new(HashMap::new()));
         let pong_received = Arc::new(AtomicBool::new(false));
@@ -913,6 +939,7 @@ impl Node {
         let committee_epoch_cm = self.config.committee_epoch_secs.max(1);
         let committee_enabled_cm = self.config.self_register_validator;
         let committee_poll_cm = (self.config.committee_epoch_secs / 4).clamp(2, 30);
+        let committee_cap_cm = self.config.committee_max_size.max(1);
 
         let running_sp = self.running.clone();
         let validator_manager_sp = self.validator_manager.clone();
@@ -923,6 +950,7 @@ impl Node {
         let own_validator_addr_sp = self.identity.node_id.clone();
         let snapshot_epoch_sp = self.config.snapshot_epoch_secs.max(1);
         let committee_epoch_sp = self.config.committee_epoch_secs.max(1);
+        let snapshot_retention_sp = self.config.snapshot_retention;
         let snapshot_enabled_sp = self.config.self_register_validator;
         let snapshot_poll_sp = (self.config.snapshot_epoch_secs / 4).clamp(2, 30);
 
@@ -1303,8 +1331,15 @@ impl Node {
                                             if let Ok(inner) = verified {
                                                 let validator = Message::deserialize_validator_registration(&inner);
                                                 if let Ok(validator_info) = validator {
-                                                    let is_new = !validator_envelopes_b.read().await
+                                                    let is_new_addr = !validator_envelopes_b.read().await
                                                         .contains_key(&validator_info.address);
+                                                    // Relay when the envelope changed — covers
+                                                    // fresh re-announcements (new nonce) without
+                                                    // resending identical cached payloads.
+                                                    let changed = validator_envelopes_b.read().await
+                                                        .get(&validator_info.address)
+                                                        .map(|c| c != &message.payload)
+                                                        .unwrap_or(true);
                                                     {
                                                         let mut vm = validator_manager_b.write().await;
                                                         let _ = vm.register_validator_from_network(validator_info.clone());
@@ -1312,11 +1347,12 @@ impl Node {
                                                     validator_envelopes_b.write().await
                                                         .insert(validator_info.address.clone(), message.payload.clone());
                                                     info!("Registered validator: {} (signed by {})", validator_info.address, envelope.node_id);
-                                                    if is_new {
+                                                    if is_new_addr {
                                                         if let Some(ref repo) = validator_repo_b {
                                                             let _ = repo.register(&validator_info).await;
                                                         }
-                                                        // Relay so indirectly connected peers learn it
+                                                    }
+                                                    if changed {
                                                         outbox.push((None, message.clone()));
                                                     }
                                                 }
@@ -1646,6 +1682,9 @@ impl Node {
         // gossip the PeerList, and re-serve cached state so late joiners and
         // peers that missed earlier broadcasts still converge.
         tokio::spawn(async move {
+            // Diff-serving cursors: only state newer than these is re-sent.
+            let mut last_served_committee: i64 = -1;
+            let mut last_offered_state: i64 = -1;
             loop {
                 if !*running_an.read().await {
                     break;
@@ -1690,39 +1729,50 @@ impl Node {
                     }
                 }
 
-                // 3) Re-serve cached validator envelopes + committee selection
-                //    + latest snapshot offer (state sync beacon)
-                let cached: Vec<Vec<u8>> = {
-                    validator_envelopes_an.read().await.values().cloned().collect()
-                };
+                // 3) Diff-serving (Gossip optimization): only serve state that
+                //    changed since the last cycle. Validator envelopes are NOT
+                //    re-served — new envelopes already relay once on first
+                //    sight (outbox), and newly connected peers get the full
+                //    cached set via serve-on-connect after the handshake.
+                //    Committee/snapshot offers re-send only when newer than
+                //    the last served value.
                 let committee_raw = committee_envelope_an.read().await.clone();
+                let send_committee = match &committee_raw {
+                    Some((sn, _)) if *sn > last_served_committee => {
+                        last_served_committee = *sn;
+                        committee_raw.clone()
+                    }
+                    _ => None,
+                };
                 let latest_snap = {
                     let sync = snapshot_sync_an.read().await;
                     sync.get_latest_local()
                 };
-                let mut connections = connections_an.write().await;
-                for (_, c) in connections.iter_mut() {
-                    for raw in &cached {
-                        let _ = c.send(Message::new(
-                            MessageType::ValidatorRegistration,
-                            node_id_an.clone().into_bytes(),
-                            raw.clone(),
-                        )).await;
+                let offer_snap = match &latest_snap {
+                    Some(snap) if snap.state_number > last_offered_state => {
+                        last_offered_state = snap.state_number;
+                        latest_snap.clone()
                     }
-                    if let Some((_, ref raw)) = committee_raw {
-                        let _ = c.send(Message::new(
-                            MessageType::CommitteeSelection,
-                            node_id_an.clone().into_bytes(),
-                            raw.clone(),
-                        )).await;
-                    }
-                    if let Some(ref snap) = latest_snap {
-                        if let Ok(meta) = Message::serialize_snapshot_metadata(snap) {
+                    _ => None,
+                };
+                if send_committee.is_some() || offer_snap.is_some() {
+                    let mut connections = connections_an.write().await;
+                    for (_, c) in connections.iter_mut() {
+                        if let Some((_, ref raw)) = send_committee {
                             let _ = c.send(Message::new(
-                                MessageType::SnapshotOffer,
+                                MessageType::CommitteeSelection,
                                 node_id_an.clone().into_bytes(),
-                                meta,
+                                raw.clone(),
                             )).await;
+                        }
+                        if let Some(ref snap) = offer_snap {
+                            if let Ok(meta) = Message::serialize_snapshot_metadata(snap) {
+                                let _ = c.send(Message::new(
+                                    MessageType::SnapshotOffer,
+                                    node_id_an.clone().into_bytes(),
+                                    meta,
+                                )).await;
+                            }
                         }
                     }
                 }
@@ -1750,7 +1800,7 @@ impl Node {
                 let mut vm = validator_manager_cm.write().await;
                 let active: Vec<String> = vm.get_active_validators()
                     .iter().map(|v| v.address.clone()).collect();
-                let members = derive_committee(active, epoch);
+                let members = derive_committee(active, epoch, committee_cap_cm);
                 if members.is_empty() {
                     continue;
                 }
@@ -1871,6 +1921,13 @@ impl Node {
                 }
                 if let Some(ref repo) = snapshot_repo_sp {
                     let _ = repo.store(&snapshot).await;
+                    if snapshot_retention_sp > 0 {
+                        if let Ok(n) = repo.retain_latest(snapshot_retention_sp as i64).await {
+                            if n > 0 {
+                                info!("Snapshot retention: pruned {} old snapshot(s)", n);
+                            }
+                        }
+                    }
                 }
                 if let Ok(meta) = Message::serialize_snapshot_metadata(&snapshot) {
                     info!("Produced snapshot for state {} — advertising", snap_state);
@@ -1886,6 +1943,22 @@ impl Node {
                 }
             }
         });
+
+        // Metrics endpoint (Prometheus text format) — optional, off by default
+        if self.config.metrics_port > 0 {
+            metrics::spawn_metrics_server(
+                self.config.metrics_port,
+                metrics::MetricsSource {
+                    connections: self.connections.clone(),
+                    validator_manager: self.validator_manager.clone(),
+                    snapshot_sync: self.snapshot_sync.clone(),
+                    snapshot_repository: self.snapshot_repository.clone(),
+                    heartbeat_tracker: self.heartbeat_tracker.clone(),
+                    started_at: Instant::now(),
+                },
+                self.running.clone(),
+            );
+        }
 
         info!("Background networking tasks started");
         Ok(())

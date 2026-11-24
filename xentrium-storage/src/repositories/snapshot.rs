@@ -29,6 +29,33 @@ impl SnapshotRepository {
         Ok(())
     }
 
+    /// Keep only the `keep` newest snapshots by state_number.
+    pub async fn retain_latest(&self, keep: i64) -> Result<u64> {
+        let res = sqlx::query(
+            r#"
+            DELETE FROM snapshots
+            WHERE state_number < (
+                SELECT state_number FROM snapshots
+                ORDER BY state_number DESC LIMIT 1 OFFSET ?
+            )
+            "#,
+        )
+        .bind(keep)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| XentriumError::DatabaseError(e.to_string()))?;
+        Ok(res.rows_affected())
+    }
+
+    /// Number of stored snapshots.
+    pub async fn count(&self) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) as n FROM snapshots")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| XentriumError::DatabaseError(e.to_string()))?;
+        row.try_get("n").map_err(|e| XentriumError::DatabaseError(e.to_string()))
+    }
+
     pub async fn get_latest(&self) -> Result<Option<Snapshot>> {
         let row = sqlx::query("SELECT * FROM snapshots ORDER BY state_number DESC LIMIT 1")
             .fetch_optional(&self.pool)

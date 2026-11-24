@@ -33,6 +33,8 @@ pub struct BasicSnapshotSync {
     advertised_snapshots: HashMap<PeerID, Vec<SnapshotMetadata>>,
     pending_requests: HashMap<i64, Instant>,
     snapshot_timeout: Duration,
+    /// Keep at most this many local snapshots (0 = unbounded).
+    max_local_snapshots: usize,
 }
 
 impl BasicSnapshotSync {
@@ -43,6 +45,7 @@ impl BasicSnapshotSync {
             advertised_snapshots: HashMap::new(),
             pending_requests: HashMap::new(),
             snapshot_timeout: Duration::from_secs(300), // 5 minutes
+            max_local_snapshots: 0,
         }
     }
 
@@ -53,7 +56,32 @@ impl BasicSnapshotSync {
             advertised_snapshots: HashMap::new(),
             pending_requests: HashMap::new(),
             snapshot_timeout: Duration::from_secs(timeout_secs),
+            max_local_snapshots: 0,
         }
+    }
+
+    /// Set the local snapshot retention window (0 = unbounded).
+    pub fn set_retention(&mut self, keep: usize) {
+        self.max_local_snapshots = keep;
+        self.prune_local();
+    }
+
+    /// Drop the oldest local snapshots beyond the retention window.
+    fn prune_local(&mut self) {
+        if self.max_local_snapshots == 0 || self.local_snapshots.len() <= self.max_local_snapshots {
+            return;
+        }
+        let mut keep: Vec<i64> = self.local_snapshots.keys().cloned().collect();
+        keep.sort_unstable();
+        let cutoff = keep.len() - self.max_local_snapshots;
+        for state in keep.into_iter().take(cutoff) {
+            self.local_snapshots.remove(&state);
+        }
+    }
+
+    /// Number of locally stored snapshots.
+    pub fn local_snapshot_count(&self) -> usize {
+        self.local_snapshots.len()
     }
 
     fn cleanup_expired_requests(&mut self) {
@@ -127,7 +155,8 @@ impl SnapshotSync for BasicSnapshotSync {
         if snapshot.state_number > self.current_state_number {
             self.current_state_number = snapshot.state_number;
         }
-        
+
+        self.prune_local();
         Ok(())
     }
 
@@ -154,7 +183,8 @@ impl SnapshotSync for BasicSnapshotSync {
         
         // Remove from pending requests
         self.pending_requests.remove(&snapshot.state_number);
-        
+
+        self.prune_local();
         Ok(())
     }
 
@@ -172,12 +202,21 @@ impl SnapshotSync for BasicSnapshotSync {
     }
 
     fn advertise_snapshot(&mut self, metadata: SnapshotMetadata) -> Result<()> {
-        // Add to advertised snapshots for this peer
-        self.advertised_snapshots
+        // Keep only a few recent offers per peer — this map previously
+        // grew by one entry per offer received, forever.
+        let list = self
+            .advertised_snapshots
             .entry(metadata.peer_id.clone())
-            .or_insert_with(Vec::new)
-            .push(metadata);
-        
+            .or_insert_with(Vec::new);
+        list.retain(|m| m.state_number != metadata.state_number);
+        list.push(metadata);
+        const MAX_ADVERTISED_PER_PEER: usize = 8;
+        if list.len() > MAX_ADVERTISED_PER_PEER {
+            list.sort_by_key(|m| m.state_number);
+            let drop_n = list.len() - MAX_ADVERTISED_PER_PEER;
+            list.drain(..drop_n);
+        }
+
         Ok(())
     }
 

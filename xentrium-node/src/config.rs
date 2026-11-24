@@ -48,12 +48,24 @@ pub struct ConsensusSection {
     /// per epoch and advertises it for peers to pull.
     #[serde(default = "default_snapshot_epoch_secs")]
     pub snapshot_epoch_secs: u64,
+    /// Max committee members — deterministic rotation picks a capped
+    /// subset of the validator set. Must match fleet-wide.
+    #[serde(default = "default_committee_max_size")]
+    pub committee_max_size: usize,
+    /// Keep latest N snapshots in memory + storage (0 = unbounded).
+    #[serde(default = "default_snapshot_retention")]
+    pub snapshot_retention: usize,
+    /// Prometheus /metrics HTTP port (0 = disabled).
+    #[serde(default)]
+    pub metrics_port: u16,
 }
 
 fn default_true() -> bool { true }
 fn default_announce_interval_secs() -> u64 { 60 }
 fn default_committee_epoch_secs() -> u64 { 86400 }
 fn default_snapshot_epoch_secs() -> u64 { 86400 }
+fn default_committee_max_size() -> usize { xentrium_shared::MAX_COMMITTEE_SIZE }
+fn default_snapshot_retention() -> usize { 10 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingSection {
@@ -104,6 +116,9 @@ impl Default for ConsensusSection {
             announce_interval_secs: default_announce_interval_secs(),
             committee_epoch_secs: default_committee_epoch_secs(),
             snapshot_epoch_secs: default_snapshot_epoch_secs(),
+            committee_max_size: default_committee_max_size(),
+            snapshot_retention: default_snapshot_retention(),
+            metrics_port: 0,
         }
     }
 }
