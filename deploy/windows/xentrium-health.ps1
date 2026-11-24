@@ -1,5 +1,7 @@
 # Xentrium health probe (Windows). Exits 0 healthy, 1 unhealthy.
 # Checks: process alive, TCP listener bound, node log written <3min ago.
+# With -RestartOnFail, kills the xentrium process on failure — the
+# supervisor task (xentrium-service.ps1) then restarts it.
 #
 # Usage:
 #   powershell -File deploy\windows\xentrium-health.ps1 -Port 30304 `
@@ -7,10 +9,18 @@
 
 param(
     [int]$Port = 30304,
-    [string]$LogPath = ".\data\node\xentrium.log"
+    [string]$LogPath = ".\data\node\xentrium.log",
+    [switch]$RestartOnFail
 )
 
-function Fail($msg) { Write-Host "HEALTH FAIL: $msg"; exit 1 }
+function Fail($msg) {
+    Write-Host "HEALTH FAIL: $msg"
+    if ($RestartOnFail) {
+        Get-Process xentrium -ErrorAction SilentlyContinue | Stop-Process -Force
+        Write-Host "killed xentrium; supervisor will restart it"
+    }
+    exit 1
+}
 
 $proc = Get-Process xentrium -ErrorAction SilentlyContinue
 if (!$proc) { Fail "no xentrium process" }
