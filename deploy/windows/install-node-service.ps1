@@ -38,8 +38,10 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
 # --- Health task: every 5 minutes; kills a wedged node so supervisor restarts it ---
 $healthArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$health`" -Port $Port -LogPath `"$LogPath`" -RestartOnFail"
 $healthAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $healthArgs
+# TimeSpan.MaxValue serializes to a duration the task schema rejects;
+# 10 years is effectively "forever" and validates fine.
 $healthTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-    -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration ([TimeSpan]::MaxValue)
+    -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
 $healthSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
 
 Register-ScheduledTask -TaskName $HealthTaskName -Action $healthAction -Trigger $healthTrigger `
