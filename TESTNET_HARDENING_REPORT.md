@@ -94,6 +94,24 @@ algorithm.
   `127.0.0.1:30304`, which is **node2's live service port**; collision
   is environmental, unrelated to these changes.
 
+## Live verification (all three nodes on hardened build)
+
+`/metrics` endpoint responding on node1/2/3 (ports 9101–9103):
+
+| Metric | node1 | node2 | node3 |
+|---|---|---|---|
+| peers | 0→reconnecting | 1 | 1 |
+| validators | 3 | 3 | 3 |
+| committee epoch | 5985128 | 5985129 | 5985125 |
+| snapshot state | 5985128 | 5985129 | 5985126 |
+| snapshots_db | 23↓ | **21** (was 49+) | 49→pruning on next store |
+| RSS | 10.3 MB | 13.5 MB | 16.1 MB |
+| heartbeat RTT | — | 253 ms peer / 328 ms avg | — |
+
+Retention verified live: `snapshots_db` on node2 dropped from 49+ to
+≤21 (`snapshot_retention = 20` + current epoch). Per-peer RTT labels
+work; uptime/RSS/peer counts populate correctly.
+
 ## Success criterion
 
 Met — the network retains identical convergence semantics with ~25×
