@@ -895,6 +895,7 @@ impl Node {
         let validator_repo_b = self.validator_repository.clone();
         let committee_repo_b = self.committee_repository.clone();
         let snapshot_repo_b = self.snapshot_repository.clone();
+        let snapshot_retention_b = self.config.snapshot_retention;
 
         let running_hb = self.running.clone();
         let connections_hb = self.connections.clone();
@@ -1489,6 +1490,9 @@ impl Node {
                                             info!("Received and stored snapshot: state {}", snap.state_number);
                                             if let Some(ref repo) = snapshot_repo_b {
                                                 let _ = repo.store(&snap).await;
+                                                if snapshot_retention_b > 0 {
+                                                    let _ = repo.retain_latest(snapshot_retention_b as i64).await;
+                                                }
                                             }
                                             // Re-offer so peers that missed the original
                                             // advertisement can also pull it from us.
