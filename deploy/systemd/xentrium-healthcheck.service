@@ -1,0 +1,11 @@
+# Runs the health probe; restarts xentrium.service on failure.
+# Scheduled by xentrium-healthcheck.timer.
+
+[Unit]
+Description=Xentrium node health check
+Requires=xentrium.service
+After=xentrium.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xentrium-health.sh

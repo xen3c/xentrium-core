@@ -1,0 +1,38 @@
+# Xentrium node — systemd unit (bootstrap/seed example: node1)
+#
+# Install:
+#   sudo cp deploy/systemd/xentrium.service /etc/systemd/system/
+#   sudo cp deploy/systemd/xentrium-healthcheck.* /etc/systemd/system/
+#   sudo cp deploy/scripts/xentrium-health.sh /usr/local/bin/
+#   sudo chmod +x /usr/local/bin/xentrium-health.sh
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now xentrium xentrium-healthcheck.timer
+#
+# Adjust WorkingDirectory/ExecStart to your deployment paths. The node
+# writes its own rotating log under <data_dir>/xentrium.log (configured
+# in the deploy TOML); stdout/stderr additionally go to journald.
+
+[Unit]
+Description=Xentrium node
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/xentrium/xentrium-core
+ExecStart=/root/xentrium/xentrium-core/target/release/xentrium \
+    --config config/deploy/node1.toml --port 443
+Restart=always
+RestartSec=10
+# Node handles SIGTERM/SIGINT for graceful shutdown
+TimeoutStopSec=30
+# Hardening (keep permissive enough for cargo/rustup environments)
+NoNewPrivileges=true
+ProtectSystem=false
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target
