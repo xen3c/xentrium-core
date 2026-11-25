@@ -27,7 +27,29 @@ pub struct NetworkSection {
     /// Allowed peer node_ids (pubkey-bound). Empty = open testnet.
     #[serde(default)]
     pub allowed_node_ids: Vec<String>,
+    /// Max concurrent connections accepted from a single IP.
+    #[serde(default = "default_max_conns_per_ip")]
+    pub max_conns_per_ip: usize,
+    /// Max inbound handshake attempts per IP per minute.
+    #[serde(default = "default_handshake_rate_per_min")]
+    pub handshake_rate_per_min: u32,
+    /// Temporary ban duration for repeat offenders (seconds).
+    #[serde(default = "default_ban_duration_secs")]
+    pub ban_duration_secs: u64,
+    /// Abuse strikes before an IP is temporarily banned.
+    #[serde(default = "default_ban_strike_threshold")]
+    pub ban_strike_threshold: u32,
+    /// Per-connection per-minute quota for ValidatorRegistration and
+    /// fallback message types.
+    #[serde(default = "default_msg_rate_per_min")]
+    pub msg_rate_per_min: u32,
 }
+
+fn default_max_conns_per_ip() -> usize { 8 }
+fn default_handshake_rate_per_min() -> u32 { 20 }
+fn default_ban_duration_secs() -> u64 { 600 }
+fn default_ban_strike_threshold() -> u32 { 10 }
+fn default_msg_rate_per_min() -> u32 { 1200 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsensusSection {
@@ -103,6 +125,11 @@ impl Default for NetworkSection {
             heartbeat_interval_secs: 30,
             connection_timeout_secs: 120,
             allowed_node_ids: vec![],
+            max_conns_per_ip: default_max_conns_per_ip(),
+            handshake_rate_per_min: default_handshake_rate_per_min(),
+            ban_duration_secs: default_ban_duration_secs(),
+            ban_strike_threshold: default_ban_strike_threshold(),
+            msg_rate_per_min: default_msg_rate_per_min(),
         }
     }
 }

@@ -115,6 +115,37 @@ impl TlsCredentials {
 
     /// The certificate DER for distribution to peers (TOFU/pinning)
     pub fn cert_der(&self) -> &[u8] { &self.cert_der }
+
+    /// Days until certificate expiry (negative if expired).
+    /// None if the cert cannot be parsed.
+    pub fn expiry_days(&self) -> Option<i64> {
+        let (_, cert) = x509_parser::parse_x509_certificate(&self.cert_der).ok()?;
+        let not_after = cert.validity().not_after.timestamp();
+        let now = chrono::Utc::now().timestamp();
+        Some((not_after - now) / 86400)
+    }
+
+    /// Rotate credentials: generate a fresh pair, verify it parses and
+    /// builds usable TLS configs, then atomically replace the file.
+    /// Returns the new expiry in days.
+    pub fn rotate(dir: &Path, node_id: &str) -> Result<i64> {
+        let creds = Self::generate(node_id)?;
+        // Replacement verification: cert parses, CN bound, configs build
+        let days = creds.expiry_days().ok_or_else(|| {
+            crate::NetworkError::ConnectionError("rotated cert failed to parse".into())
+        })?;
+        creds.server_config()?;
+        creds.client_config()?;
+        std::fs::create_dir_all(dir).ok();
+        let path = dir.join("tls_credentials.bin");
+        let tmp = dir.join("tls_credentials.tmp");
+        std::fs::write(&tmp, creds.encode())
+            .map_err(|e| crate::NetworkError::ConnectionError(format!("TLS write: {}", e)))?;
+        let _ = std::fs::remove_file(&path);
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| crate::NetworkError::ConnectionError(format!("TLS rename: {}", e)))?;
+        Ok(days)
+    }
 }
 
 /// Custom certificate verifier: validates structure + expiry, extracts CN as node identity.

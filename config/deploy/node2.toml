@@ -15,6 +15,12 @@ max_peers = 50
 heartbeat_interval_secs = 30
 connection_timeout_secs = 120
 allowed_node_ids = []
+# --- abuse protection (open testnet) ---
+max_conns_per_ip = 3        # simultaneous connections allowed from one IP
+handshake_rate_per_min = 20 # new handshakes per minute per IP
+ban_duration_secs = 300     # temp-ban duration after strike threshold
+ban_strike_threshold = 10   # abuse strikes that trigger a temp ban
+msg_rate_per_min = 1200     # per-connection msg ceiling (protected types have stricter caps)
 
 [consensus]
 auto_committee_rotation = true

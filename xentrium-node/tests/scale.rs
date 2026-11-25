@@ -41,6 +41,12 @@ fn node_config(node_id: &str, port: u16, tag: &str, bootstrap: Vec<String>) -> N
         committee_max_size: 51,
         snapshot_retention: 10,
         metrics_port: 0,
+        // Scale tests must not trip the limiters under synthetic load.
+        max_conns_per_ip: 64,
+        handshake_rate_per_min: 100_000,
+        ban_duration_secs: 30,
+        ban_strike_threshold: 100_000,
+        msg_rate_per_min: 1_000_000,
     }
 }
 
@@ -88,6 +94,13 @@ fn db_size(tag: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn rss_bytes() -> u64 {
+    let pid = sysinfo::Pid::from_u32(std::process::id());
+    let mut sys = sysinfo::System::new();
+    sys.refresh_process(pid);
+    sys.process(pid).map(|p| p.memory()).unwrap_or(0)
+}
+
 fn init_logs() {
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
@@ -96,9 +109,9 @@ fn init_logs() {
 }
 
 /// Ramp test: 3-node star network, inject validators to reach
-/// 10 -> 25 -> 50 total, measure each stage.
+/// 10 -> 25 -> 50 -> 100 -> 200 total, measure each stage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
-async fn test_scale_ramp_10_25_50() {
+async fn test_scale_ramp() {
     init_logs();
     let seed_addr = "127.0.0.1:47101".to_string();
 
@@ -135,7 +148,7 @@ async fn test_scale_ramp_10_25_50() {
     .await;
     assert!(base.is_some(), "baseline convergence failed");
 
-    let stages = [10usize, 25, 50];
+    let stages = [10usize, 25, 50, 100, 200];
     let mut injected = 0usize; // synthetic validators injected so far
 
     eprintln!("\n=== SCALE AUDIT ===");
@@ -162,7 +175,10 @@ async fn test_scale_ramp_10_25_50() {
         }
 
         // Propagation: all three nodes reach `target` active validators.
-        let prop = wait_for(120, &format!("{} validators on all nodes", target), || async {
+        let msgs_before = node1.messages_received()
+            + node2.messages_received()
+            + node3.messages_received();
+        let prop = wait_for(180, &format!("{} validators on all nodes", target), || async {
             node1.validator_manager().read().await.active_validator_count() == target
                 && node2.validator_manager().read().await.active_validator_count() == target
                 && node3.validator_manager().read().await.active_validator_count() == target
@@ -170,13 +186,20 @@ async fn test_scale_ramp_10_25_50() {
         .await;
         let prop_ms = prop.map(|d| d.as_millis() as u64).unwrap_or(u64::MAX);
 
-        // Committee: all nodes agree on an identical committee
-        // (committee = full rotated validator set).
-        let comm = wait_for(60, &format!("committee of {}", target), || async {
+        let msgs_after = node1.messages_received()
+            + node2.messages_received()
+            + node3.messages_received();
+        let stage_msgs = msgs_after.saturating_sub(msgs_before);
+
+        // Committee: all nodes agree on an identical committee.
+        // Committee is capped at committee_max_size (51) — expected
+        // size is min(target, 51).
+        let expected_committee = target.min(51);
+        let comm = wait_for(90, &format!("committee of {}", expected_committee), || async {
             let c1 = node1.validator_manager().read().await.get_committee_members();
             let c2 = node2.validator_manager().read().await.get_committee_members();
             let c3 = node3.validator_manager().read().await.get_committee_members();
-            c1.len() == target && c1 == c2 && c2 == c3
+            c1.len() == expected_committee && c1 == c2 && c2 == c3
         })
         .await;
         let comm_ms = comm.map(|d| d.as_millis() as u64).unwrap_or(u64::MAX);
@@ -192,8 +215,8 @@ async fn test_scale_ramp_10_25_50() {
         let snap_ms = snap.map(|d| d.as_millis() as u64).unwrap_or(u64::MAX);
 
         eprintln!(
-            "stage {} validators | propagation {}ms | committee {}ms | snapshot {}ms | db: seed={}B n2={}B n3={}B",
-            target, prop_ms, comm_ms, snap_ms,
+            "stage {} validators | propagation {}ms | committee {}ms | snapshot {}ms | msgs {} | rss {}MB | db: seed={}B n2={}B n3={}B",
+            target, prop_ms, comm_ms, snap_ms, stage_msgs, rss_bytes() / 1_048_576,
             db_size("s1"), db_size("s2"), db_size("s3"),
         );
 
@@ -203,11 +226,11 @@ async fn test_scale_ramp_10_25_50() {
     }
 
     // Memory leak / growth sanity: validator map sizes should be stable
-    // (50 entries each — no unbounded per-message structures).
+    // (200 entries each — no unbounded per-message structures).
     {
         let vm_arc = node1.validator_manager();
         let vm = vm_arc.read().await;
-        assert_eq!(vm.active_validator_count(), 50);
+        assert_eq!(vm.active_validator_count(), 200);
     }
     let ann = node1.known_announcement_count().await;
     eprintln!("node1 known announcements: {}", ann);

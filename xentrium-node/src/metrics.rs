@@ -14,6 +14,7 @@ use tracing::{info, warn};
 use xentrium_consensus::ValidatorManager;
 use xentrium_network::{BasicSnapshotSync, HeartbeatTracker, SnapshotSync, TcpConnection};
 use xentrium_storage::SnapshotRepository;
+use crate::rate_limit::{AbuseCounters, RateLimiter};
 
 /// Everything the endpoint needs to sample, shared from the Node.
 pub struct MetricsSource {
@@ -23,6 +24,10 @@ pub struct MetricsSource {
     pub snapshot_repository: Option<Arc<SnapshotRepository>>,
     pub heartbeat_tracker: Arc<RwLock<HeartbeatTracker>>,
     pub started_at: Instant,
+    pub abuse: Arc<AbuseCounters>,
+    pub rate_limiter: Arc<std::sync::Mutex<RateLimiter>>,
+    pub msgs_in: Arc<std::sync::atomic::AtomicU64>,
+    pub cert_expiry_days: Arc<std::sync::atomic::AtomicI64>,
 }
 
 /// Spawn the metrics listener on `port`. Returns immediately.
@@ -109,5 +114,15 @@ async fn render(src: &MetricsSource) -> String {
             peer.endpoint, d.as_millis() as u64
         );
     }
+    use std::sync::atomic::Ordering::Relaxed;
+    let _ = writeln!(out, "xentrium_msgs_in_total {}", src.msgs_in.load(Relaxed));
+    let _ = writeln!(out, "xentrium_tls_cert_expiry_days {}", src.cert_expiry_days.load(Relaxed));
+    let bans = src.rate_limiter.lock().unwrap_or_else(|e| e.into_inner()).banned_count();
+    let _ = writeln!(out, "xentrium_rate_limit_hits_total {}", src.abuse.rate_limit_hits.load(Relaxed));
+    let _ = writeln!(out, "xentrium_rejected_connections_total {}", src.abuse.rejected_connections.load(Relaxed));
+    let _ = writeln!(out, "xentrium_rejected_handshakes_total {}", src.abuse.rejected_handshakes.load(Relaxed));
+    let _ = writeln!(out, "xentrium_replay_rejections_total {}", src.abuse.replay_rejections.load(Relaxed));
+    let _ = writeln!(out, "xentrium_peer_bans_total {}", src.abuse.peer_bans.load(Relaxed));
+    let _ = writeln!(out, "xentrium_peers_banned_current {}", bans);
     out
 }

@@ -42,6 +42,10 @@ struct Args {
     /// Run pre-flight deployment checks and exit (no node start)
     #[arg(long)]
     doctor: bool,
+
+    /// Rotate TLS credentials (new cert + key), verify, and exit
+    #[arg(long)]
+    rotate_tls: bool,
 }
 
 #[tokio::main]
@@ -75,6 +79,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_doctor(&toml_config);
     }
 
+    if args.rotate_tls {
+        return rotate_tls(&toml_config);
+    }
+
     // Initialize logging
     init_logging(&toml_config.logging);
 
@@ -103,6 +111,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         committee_max_size: toml_config.consensus.committee_max_size,
         snapshot_retention: toml_config.consensus.snapshot_retention,
         metrics_port: toml_config.consensus.metrics_port,
+        max_conns_per_ip: toml_config.network.max_conns_per_ip,
+        handshake_rate_per_min: toml_config.network.handshake_rate_per_min,
+        ban_duration_secs: toml_config.network.ban_duration_secs,
+        ban_strike_threshold: toml_config.network.ban_strike_threshold,
+        msg_rate_per_min: toml_config.network.msg_rate_per_min,
     };
 
     // Create node
@@ -218,7 +231,15 @@ fn run_doctor(config: &TomlConfig) -> Result<(), Box<dyn std::error::Error>> {
         // Reuse identity node_id if available
         if let Ok(identity) = xentrium_network::NodeIdentity::load_or_create(&id_path) {
             match xentrium_network::TlsCredentials::load_or_generate(&tls_dir, &identity.node_id) {
-                Ok(_) => check(true, "TLS credentials", format!("cert CN bound to {} in {}", identity.node_id, tls_dir.display())),
+                Ok(creds) => {
+                    check(true, "TLS credentials", format!("cert CN bound to {} in {}", identity.node_id, tls_dir.display()));
+                    match creds.expiry_days() {
+                        Some(d) if d < 0 => check(false, "TLS certificate expiry", "EXPIRED — run `xentrium --rotate-tls`".to_string()),
+                        Some(d) if d < 30 => check(false, "TLS certificate expiry", format!("{} days left — rotate soon (`xentrium --rotate-tls`)", d)),
+                        Some(d) => check(true, "TLS certificate expiry", format!("{} days remaining", d)),
+                        None => check(false, "TLS certificate expiry", "unreadable".to_string()),
+                    }
+                }
                 Err(e) => check(false, "TLS credentials", format!("{}", e)),
             }
         }
@@ -254,6 +275,23 @@ fn run_doctor(config: &TomlConfig) -> Result<(), Box<dyn std::error::Error>> {
         println!("DOCTOR: {} CHECK(S) FAILED — fix before starting", failures);
         Err("doctor checks failed".into())
     }
+}
+
+/// Rotate TLS credentials: generate a new cert+key, verify it parses and
+/// builds working TLS configs, then atomically swap it in. Peers re-pin
+/// the new cert on next handshake (TOFU). Run with the node stopped.
+fn rotate_tls(config: &TomlConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = config.data_directory();
+    let id_path = std::path::Path::new(&data_dir).join("node.identity");
+    let identity = xentrium_network::NodeIdentity::load_or_create(&id_path)
+        .map_err(|e| format!("identity: {}", e))?;
+    let tls_dir = xentrium_network::tls_dir(&data_dir);
+    let days = xentrium_network::TlsCredentials::rotate(&tls_dir, &identity.node_id)
+        .map_err(|e| format!("rotation: {}", e))?;
+    println!("TLS ROTATED — new certificate for CN={}, valid {} days", identity.node_id, days);
+    println!("  stored: {}", tls_dir.join("tls_credentials.bin").display());
+    println!("  peers will accept it on next connect (TOFU re-pin); restart the node to apply");
+    Ok(())
 }
 
 fn init_logging(config: &xentrium_node::config::LoggingSection) {

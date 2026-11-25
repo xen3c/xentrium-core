@@ -35,6 +35,11 @@ fn node_config(node_id: &str, port: u16, tag: &str, bootstrap: Vec<String>) -> N
         committee_max_size: 51,
         snapshot_retention: 10,
         metrics_port: 0,
+        max_conns_per_ip: 64,
+        handshake_rate_per_min: 100_000,
+        ban_duration_secs: 30,
+        ban_strike_threshold: 100_000,
+        msg_rate_per_min: 1_000_000,
     }
 }
 

@@ -4,7 +4,7 @@ use std::io::{Cursor, Read, Write};
 use xentrium_shared::{Address, ValidatorInfo, ValidatorState, Snapshot};
 
 /// Message types
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MessageType {
     Handshake,
     Transaction,

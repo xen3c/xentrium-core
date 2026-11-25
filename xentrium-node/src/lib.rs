@@ -1,5 +1,6 @@
 pub mod config;
 pub mod metrics;
+pub mod rate_limit;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -48,6 +49,23 @@ pub struct NodeConfig {
     /// Prometheus /metrics HTTP port (0 = disabled).
     #[serde(default)]
     pub metrics_port: u16,
+    /// Max concurrent connections accepted from a single IP.
+    #[serde(default = "default_max_conns_per_ip")]
+    pub max_conns_per_ip: usize,
+    /// Max inbound handshake attempts per IP per minute.
+    #[serde(default = "default_handshake_rate_per_min")]
+    pub handshake_rate_per_min: u32,
+    /// Temporary ban duration for repeat offenders (seconds).
+    #[serde(default = "default_ban_duration_secs")]
+    pub ban_duration_secs: u64,
+    /// Abuse strikes before an IP is temporarily banned.
+    #[serde(default = "default_ban_strike_threshold")]
+    pub ban_strike_threshold: u32,
+    /// Per-connection per-minute quota for ValidatorRegistration and
+    /// fallback message types (PeerList/Committee/SnapshotRequest have
+    /// stricter built-in caps).
+    #[serde(default = "default_msg_rate_per_min")]
+    pub msg_rate_per_min: u32,
 }
 
 fn default_announce_interval_secs() -> u64 { 60 }
@@ -55,6 +73,11 @@ fn default_committee_epoch_secs() -> u64 { 86400 }
 fn default_snapshot_epoch_secs() -> u64 { 86400 }
 fn default_committee_max_size() -> usize { MAX_COMMITTEE_SIZE }
 fn default_snapshot_retention() -> usize { 10 }
+fn default_max_conns_per_ip() -> usize { 8 }
+fn default_handshake_rate_per_min() -> u32 { 20 }
+fn default_ban_duration_secs() -> u64 { 600 }
+fn default_ban_strike_threshold() -> u32 { 10 }
+fn default_msg_rate_per_min() -> u32 { 1200 }
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -75,6 +98,11 @@ impl Default for NodeConfig {
             committee_max_size: default_committee_max_size(),
             snapshot_retention: default_snapshot_retention(),
             metrics_port: 0,
+            max_conns_per_ip: default_max_conns_per_ip(),
+            handshake_rate_per_min: default_handshake_rate_per_min(),
+            ban_duration_secs: default_ban_duration_secs(),
+            ban_strike_threshold: default_ban_strike_threshold(),
+            msg_rate_per_min: default_msg_rate_per_min(),
         }
     }
 }
@@ -93,6 +121,15 @@ pub fn derive_committee(mut validators: Vec<String>, epoch: u64, cap: usize) -> 
     validators.rotate_left(rot);
     validators.truncate(cap);
     validators
+}
+
+fn rate_limiter_for(config: &NodeConfig) -> rate_limit::RateLimiter {
+    rate_limit::RateLimiter::new(&rate_limit::RateLimitConfig {
+        max_conns_per_ip: config.max_conns_per_ip,
+        handshake_rate_per_min: config.handshake_rate_per_min,
+        ban_duration_secs: config.ban_duration_secs,
+        ban_strike_threshold: config.ban_strike_threshold,
+    })
 }
 
 /// Node runtime
@@ -125,6 +162,14 @@ pub struct Node {
     validator_envelopes: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     /// Latest committee selection envelope seen (state_number, raw payload).
     committee_envelope: Arc<RwLock<Option<(i64, Vec<u8>)>>>,
+    /// Abuse counters rendered by /metrics (rate limits, rejections, bans).
+    abuse: Arc<rate_limit::AbuseCounters>,
+    /// Accept-side rate limiter: per-IP caps, handshake window, temp bans.
+    rate_limiter: Arc<std::sync::Mutex<rate_limit::RateLimiter>>,
+    /// Total inbound messages received (traffic metric).
+    msgs_in: Arc<std::sync::atomic::AtomicU64>,
+    /// TLS certificate expiry in days from last check (-1 = unknown).
+    cert_expiry_days: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl Node {
@@ -166,6 +211,7 @@ impl Node {
         known_announcements.insert(identity.node_id.clone(), own_ann);
         let mut known_identities = HashMap::new();
         known_identities.insert(identity.node_id.clone(), identity.public_key_bytes());
+        let limiter = rate_limiter_for(&config);
 
         Ok(Self {
             config,
@@ -189,6 +235,10 @@ impl Node {
             known_identities: Arc::new(RwLock::new(known_identities)),
             validator_envelopes: Arc::new(RwLock::new(HashMap::new())),
             committee_envelope: Arc::new(RwLock::new(None)),
+            abuse: Arc::new(rate_limit::AbuseCounters::default()),
+            rate_limiter: Arc::new(std::sync::Mutex::new(limiter)),
+            msgs_in: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cert_expiry_days: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
         })
     }
 
@@ -237,6 +287,7 @@ impl Node {
         known_announcements.insert(identity.node_id.clone(), own_ann);
         let mut known_identities = HashMap::new();
         known_identities.insert(identity.node_id.clone(), identity.public_key_bytes());
+        let limiter = rate_limiter_for(&config);
 
         Ok(Self {
             config,
@@ -260,6 +311,10 @@ impl Node {
             known_identities: Arc::new(RwLock::new(known_identities)),
             validator_envelopes: Arc::new(RwLock::new(HashMap::new())),
             committee_envelope: Arc::new(RwLock::new(None)),
+            abuse: Arc::new(rate_limit::AbuseCounters::default()),
+            rate_limiter: Arc::new(std::sync::Mutex::new(limiter)),
+            msgs_in: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cert_expiry_days: Arc::new(std::sync::atomic::AtomicI64::new(-1)),
         })
     }
 
@@ -449,6 +504,16 @@ impl Node {
     /// Number of verified peer announcements currently known (for gossip/tests)
     pub async fn known_announcement_count(&self) -> usize {
         self.known_announcements.read().await.len()
+    }
+
+    /// Total inbound messages processed on the receive loop (traffic counter).
+    pub fn messages_received(&self) -> u64 {
+        self.msgs_in.load(Ordering::Relaxed)
+    }
+
+    /// Abuse counters (rate-limit hits, rejections, bans) for metrics/tests.
+    pub fn abuse_counters(&self) -> Arc<rate_limit::AbuseCounters> {
+        self.abuse.clone()
     }
 
     /// Get transport reference
@@ -771,6 +836,21 @@ impl Node {
             &tls_dir(&self.config.data_directory),
             &self.identity.node_id,
         ).map_err(|e| XentriumError::DatabaseError(format!("TLS credentials: {}", e)))?;
+        // Certificate lifecycle monitoring: track days-to-expiry
+        match creds.expiry_days() {
+            Some(d) if d < 30 => {
+                self.cert_expiry_days.store(d, Ordering::Relaxed);
+                tracing::warn!(
+                    "TLS certificate expires in {} days — rotate with `xentrium --rotate-tls`", d);
+            }
+            Some(d) => {
+                self.cert_expiry_days.store(d, Ordering::Relaxed);
+                info!("TLS certificate valid for {} days", d);
+            }
+            None => {
+                tracing::warn!("TLS certificate expiry unreadable — consider rotating");
+            }
+        }
         let tls_config = TlsTransportConfig::new(&creds)
             .map_err(|e| XentriumError::DatabaseError(format!("TLS config: {}", e)))?;
         transport.enable_tls(tls_config);
@@ -877,6 +957,8 @@ impl Node {
         let connections_a = self.connections.clone();
         let discovery_a = self.discovery.clone();
         let identity_a = self.identity.clone();
+        let abuse_a = self.abuse.clone();
+        let rate_limiter_a = self.rate_limiter.clone();
 
         let running_b = self.running.clone();
         let connections_b = self.connections.clone();
@@ -896,6 +978,10 @@ impl Node {
         let committee_repo_b = self.committee_repository.clone();
         let snapshot_repo_b = self.snapshot_repository.clone();
         let snapshot_retention_b = self.config.snapshot_retention;
+        let abuse_b = self.abuse.clone();
+        let rate_limiter_b = self.rate_limiter.clone();
+        let msgs_in_b = self.msgs_in.clone();
+        let msg_rate_b = self.config.msg_rate_per_min;
 
         let running_hb = self.running.clone();
         let connections_hb = self.connections.clone();
@@ -976,10 +1062,48 @@ impl Node {
 
                 match accepted {
                     Ok(Ok((stream, remote_addr))) => {
+                        // Connection rate limiting: banned IPs and per-IP
+                        // caps/handshake-rate bursts are dropped before TLS.
+                        let ip = remote_addr.ip();
+                        let conns_for_ip = {
+                            let conns = connections_a.read().await;
+                            conns.keys().filter(|k| k.ip() == ip).count()
+                        };
+                        let verdict = {
+                            let mut rl = rate_limiter_a.lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            rl.check_inbound(ip, conns_for_ip)
+                        };
+                        match verdict {
+                            rate_limit::AcceptVerdict::Allow => {}
+                            v => {
+                                abuse_a.bump(&abuse_a.rejected_connections);
+                                let new_ban = {
+                                    let mut rl = rate_limiter_a.lock()
+                                        .unwrap_or_else(|e| e.into_inner());
+                                    rl.record_strike(ip)
+                                };
+                                if new_ban {
+                                    abuse_a.bump(&abuse_a.peer_bans);
+                                    info!("Temporarily banned {} after repeated abuse", ip);
+                                }
+                                match v {
+                                    rate_limit::AcceptVerdict::Banned =>
+                                        info!("Rejected connection from banned IP {}", ip),
+                                    _ =>
+                                        info!("Rate-limited connection from {}", ip),
+                                }
+                                drop(stream);
+                                continue;
+                            }
+                        }
+
                         let transport_c = transport_a.clone();
                         let identity_c = identity_a.clone();
                         let discovery_c = discovery_a.clone();
                         let connections_c = connections_a.clone();
+                        let abuse_c = abuse_a.clone();
+                        let rate_limiter_c = rate_limiter_a.clone();
                         tokio::spawn(async move {
                             let mut connection = {
                                 let transport = transport_c.read().await;
@@ -990,10 +1114,28 @@ impl Node {
                                     Ok(Ok(connection)) => connection,
                                     Ok(Err(e)) => {
                                         info!("TLS accept failed from {:?}: {:?}", remote_addr, e);
+                                        abuse_c.bump(&abuse_c.rejected_handshakes);
+                                        let new_ban = {
+                                            let mut rl = rate_limiter_c.lock()
+                                                .unwrap_or_else(|e| e.into_inner());
+                                            rl.record_strike(remote_addr.ip())
+                                        };
+                                        if new_ban {
+                                            abuse_c.bump(&abuse_c.peer_bans);
+                                        }
                                         return;
                                     }
                                     Err(_) => {
                                         info!("TLS accept timed out from {:?}", remote_addr);
+                                        abuse_c.bump(&abuse_c.rejected_handshakes);
+                                        let new_ban = {
+                                            let mut rl = rate_limiter_c.lock()
+                                                .unwrap_or_else(|e| e.into_inner());
+                                            rl.record_strike(remote_addr.ip())
+                                        };
+                                        if new_ban {
+                                            abuse_c.bump(&abuse_c.peer_bans);
+                                        }
                                         return;
                                     }
                                 }
@@ -1112,6 +1254,8 @@ impl Node {
 
         // Spawn message receive loop task
         tokio::spawn(async move {
+            // Per-connection message quotas — persist across loop iterations.
+            let mut msg_quotas: HashMap<std::net::SocketAddr, rate_limit::PerConnQuota> = HashMap::new();
             loop {
                 let is_running = *running_b.read().await;
                 if !is_running {
@@ -1137,7 +1281,32 @@ impl Node {
                         ).await {
                             Ok(Ok(Some(message))) => {
                                 info!("Received message from {:?}: {:?}", addr, message.message_type);
-                                
+                                msgs_in_b.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                                // Message rate limiting: per-connection sliding
+                                // window quota on abuse-sensitive types. Over-quota
+                                // messages are dropped; repeated violations earn
+                                // strikes -> temporary IP ban.
+                                let over_quota = !msg_quotas
+                                    .entry(addr)
+                                    .or_insert_with(|| rate_limit::PerConnQuota::new(msg_rate_b))
+                                    .allow(&message.message_type);
+                                if over_quota {
+                                    abuse_b.bump(&abuse_b.rate_limit_hits);
+                                    let new_ban = {
+                                        let mut rl = rate_limiter_b.lock()
+                                            .unwrap_or_else(|e| e.into_inner());
+                                        rl.record_strike(addr.ip())
+                                    };
+                                    if new_ban {
+                                        abuse_b.bump(&abuse_b.peer_bans);
+                                        info!("Temporarily banned {} after repeated abuse", addr.ip());
+                                        msg_quotas.remove(&addr);
+                                        connections_to_remove.push(addr);
+                                    }
+                                    continue;
+                                }
+
                                 // Handle Handshake: verify peer identity, reject invalid
                                 if message.message_type == MessageType::Handshake {
                                     let hs = Message::deserialize_handshake(&message.payload);
@@ -1208,12 +1377,22 @@ impl Node {
                                                 }
                                                 _ => {
                                                     info!("Rejecting peer {:?}: invalid handshake, cert/identity mismatch, not allowlisted, or replay", addr);
+                                                    abuse_b.bump(&abuse_b.rejected_handshakes);
+                                                    let new_ban = {
+                                                        let mut rl = rate_limiter_b.lock()
+                                                            .unwrap_or_else(|e| e.into_inner());
+                                                        rl.record_strike(addr.ip())
+                                                    };
+                                                    if new_ban {
+                                                        abuse_b.bump(&abuse_b.peer_bans);
+                                                    }
                                                     connections_to_remove.push(addr);
                                                 }
                                             }
                                         }
                                         Err(_) => {
                                             info!("Rejecting peer {:?}: malformed handshake", addr);
+                                            abuse_b.bump(&abuse_b.rejected_handshakes);
                                             connections_to_remove.push(addr);
                                         }
                                     }
@@ -1359,6 +1538,7 @@ impl Node {
                                                 }
                                             }
                                         } else {
+                                            abuse_b.bump(&abuse_b.replay_rejections);
                                             info!("Rejected ValidatorRegistration from {:?}: invalid signature, replay, or identity mismatch", addr);
                                         }
                                     } else {
@@ -1420,6 +1600,7 @@ impl Node {
                                                 }
                                             }
                                         } else {
+                                            abuse_b.bump(&abuse_b.replay_rejections);
                                             info!("Rejected CommitteeSelection from {:?}: invalid signature, replay, or identity mismatch", addr);
                                         }
                                     } else {
@@ -1959,6 +2140,10 @@ impl Node {
                     snapshot_repository: self.snapshot_repository.clone(),
                     heartbeat_tracker: self.heartbeat_tracker.clone(),
                     started_at: Instant::now(),
+                    abuse: self.abuse.clone(),
+                    rate_limiter: self.rate_limiter.clone(),
+                    msgs_in: self.msgs_in.clone(),
+                    cert_expiry_days: self.cert_expiry_days.clone(),
                 },
                 self.running.clone(),
             );
